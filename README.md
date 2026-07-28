@@ -10,10 +10,9 @@ to provide:
 - an interactive TUI;
 - local SQLite history without putting machine state in Git.
 
-This repository is currently a local scaffold and has not been published.
-Its first apply slice is intentionally narrow: it can install missing Homebrew
-formulae and casks plus declared Bun global tools on config-declared local and
-SSH machines.
+Its package apply slice is intentionally narrow: it can install missing
+Homebrew formulae and casks plus declared Bun global tools on config-declared
+local and SSH machines.
 
 Build the committed checkout into the user-local PATH:
 
@@ -45,6 +44,23 @@ Once the identity is registered, onboarding includes a live local plan and
 prints the matching `apply --local --dry-run` command. `--local` is accepted
 only when the current Mac's hardware fingerprint matches the requested machine;
 it cannot be used to bypass machine selection.
+
+Portable links have a separately scoped transaction:
+
+```sh
+envctl links apply \
+  --config /path/to/env-config \
+  --machine example-mac \
+  --local \
+  --dry-run \
+  --json
+```
+
+The transaction blocks before mutation if any source digest, occupied target,
+or real-directory parent check fails. Explicit `--yes` moves an existing
+symlink into a timestamped machine-local backup, creates all links as one
+transaction, verifies every resulting target, and rolls earlier operations back
+if a later operation fails. It never replaces a regular file or directory.
 
 For a clean Mac, `scripts/bootstrap-macos` is the versioned bootstrap
 foundation. It expects the age identity and encrypted read-only `env-config`
@@ -81,6 +97,8 @@ go run ./cmd/envctl apply \
   --config ../env-config --machine matilda --manager bun --yes --json
 go run ./cmd/envctl apply \
   --config ../env-config --machine matilda --manager mas --dry-run --json
+go run ./cmd/envctl links apply \
+  --config ../env-config --machine ai --local --dry-run --json
 go run ./cmd/envctl config resolve \
   --config ./examples/env-config --machine example-mac --json
 go run ./cmd/envctl history --json
@@ -115,8 +133,9 @@ a regular source file inside the config checkout and a home-relative target.
 Source content is included in the configuration digest. Agentless audits hash
 the source on each machine and inspect the target without following it; plans
 distinguish missing targets, occupied targets, wrong symlinks, missing sources,
-and stale source content. This slice is read-only: link findings never become
-executor actions.
+and stale source content. Link changes use the separately confirmed
+`links apply` transaction described above; they never enter package-manager
+execution.
 `import-legacy` converts the old package configuration into a reviewable JSON
 draft; it never modifies the input.
 `plan` compares that draft with the live Homebrew inventory and reports

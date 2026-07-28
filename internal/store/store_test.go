@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/VeniVidiVici/envctl/internal/model"
+	"github.com/VeniVidiVici/envctl/internal/portablelink"
 )
 
 func TestRecordsAuditPlanAndHistory(t *testing.T) {
@@ -110,8 +111,8 @@ func TestOpenAppliesMigrationsIdempotently(t *testing.T) {
 	if err := second.db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 2 {
-		t.Fatalf("migration count = %d, want 2", count)
+	if count != 3 {
+		t.Fatalf("migration count = %d, want 3", count)
 	}
 }
 
@@ -190,6 +191,154 @@ func TestRecordsApplyLifecycleAndVerification(t *testing.T) {
 			"states = run %q plan %q action %q verification %q",
 			runStatus, planStatus, actionStatus, verificationID,
 		)
+	}
+}
+
+func TestRecordsPortableLinkLifecycleAndBackup(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	ctx := context.Background()
+	machine := MachineInfo{ID: "example-machine", Hostname: "example-machine"}
+	before, err := state.RecordAudit(ctx, machine, model.Inventory{
+		CollectedAt: time.Now().UTC(),
+		Collectors:  []string{"portable-link"},
+		Links: []model.LinkObservation{{
+			ID: "shell", Source: "/repo/.zshrc", Target: "/home/.zshrc",
+			SourceType: "file", SourceDigest: "digest",
+			TargetType: "symlink", LinkTarget: "/legacy/.zshrc",
+			ResolvedTarget: "/legacy/.zshrc",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := portablelink.TransactionPlan{
+		RunID: "link-run", Ready: true,
+		Actions: []portablelink.LinkAction{{
+			Sequence: 1, LinkID: "shell", Type: portablelink.ActionReplace,
+			Source: "/repo/.zshrc", Target: "/home/.zshrc",
+			BackupPath: "/home/.local/state/envctl/backups/run/.zshrc",
+		}},
+	}
+	record, err := state.RecordLinkPlan(
+		ctx, machine.ID, before.ID, "digest", "links apply", false, plan,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.BeginApply(ctx, record.RunID, record.PlanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.StartAction(ctx, record.PlanID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.RecordActionBackup(
+		ctx, record.PlanID, 1, "/home/.zshrc",
+		"/home/.local/state/envctl/backups/run/.zshrc",
+		"/legacy/.zshrc",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.FinishAction(
+		ctx, record.PlanID, 1, ActionStatusCompleted, "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	after, err := state.RecordAudit(ctx, machine, model.Inventory{
+		CollectedAt: time.Now().UTC(),
+		Collectors:  []string{"portable-link"},
+		Links: []model.LinkObservation{{
+			ID: "shell", Source: "/repo/.zshrc", Target: "/home/.zshrc",
+			SourceType: "file", SourceDigest: "digest",
+			TargetType: "symlink", LinkTarget: "../repo/.zshrc",
+			ResolvedTarget: "/repo/.zshrc",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.CompleteApply(
+		ctx, record.RunID, record.PlanID, after.ID, ActionStatusCompleted,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var linkRows, backupRows int
+	if err := state.db.QueryRow(
+		"SELECT COUNT(*) FROM link_inventory_items",
+	).Scan(&linkRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.db.QueryRow(
+		"SELECT COUNT(*) FROM backups",
+	).Scan(&backupRows); err != nil {
+		t.Fatal(err)
+	}
+	if linkRows != 2 || backupRows != 1 {
+		t.Fatalf("link rows = %d, backup rows = %d", linkRows, backupRows)
+	}
+}
+
+func TestPortableLinkRollbackRemovesStaleBackupRecord(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	ctx := context.Background()
+	machine := MachineInfo{ID: "example-machine", Hostname: "example-machine"}
+	snapshot, err := state.RecordAudit(ctx, machine, model.Inventory{
+		CollectedAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := portablelink.TransactionPlan{
+		RunID: "link-run", Ready: true,
+		Actions: []portablelink.LinkAction{{
+			Sequence: 1, LinkID: "shell", Type: portablelink.ActionReplace,
+		}},
+	}
+	record, err := state.RecordLinkPlan(
+		ctx, machine.ID, snapshot.ID, "digest", "links apply", false, plan,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.BeginApply(ctx, record.RunID, record.PlanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.StartAction(ctx, record.PlanID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.RecordActionBackup(
+		ctx, record.PlanID, 1, "/home/.zshrc", "/backup/.zshrc", "legacy",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.FinishAction(
+		ctx, record.PlanID, 1, ActionStatusCompleted, "",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.RollBackAction(ctx, record.PlanID, 1, "later action failed"); err != nil {
+		t.Fatal(err)
+	}
+	var status string
+	var backups int
+	if err := state.db.QueryRow(
+		"SELECT status FROM actions WHERE plan_id = ?",
+		record.PlanID,
+	).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.db.QueryRow("SELECT COUNT(*) FROM backups").Scan(&backups); err != nil {
+		t.Fatal(err)
+	}
+	if status != ActionStatusRolledBack || backups != 0 {
+		t.Fatalf("status = %q, backups = %d", status, backups)
 	}
 }
 

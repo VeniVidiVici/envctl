@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/VeniVidiVici/envctl/internal/model"
+	"github.com/VeniVidiVici/envctl/internal/portablelink"
 	_ "modernc.org/sqlite"
 )
 
@@ -68,11 +70,12 @@ type Decision struct {
 }
 
 const (
-	ActionStatusProposed  = "proposed"
-	ActionStatusRunning   = "running"
-	ActionStatusCompleted = "completed"
-	ActionStatusFailed    = "failed"
-	ActionStatusSkipped   = "skipped"
+	ActionStatusProposed   = "proposed"
+	ActionStatusRunning    = "running"
+	ActionStatusCompleted  = "completed"
+	ActionStatusFailed     = "failed"
+	ActionStatusSkipped    = "skipped"
+	ActionStatusRolledBack = "rolled-back"
 )
 
 func Open(path string) (*Store, error) {
@@ -261,6 +264,20 @@ func (s *Store) RecordAudit(
 			return SnapshotRecord{}, fmt.Errorf("record inventory item %s: %w", item.Package, err)
 		}
 	}
+	for _, item := range inventory.Links {
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO link_inventory_items(
+				snapshot_id, link_id, source_path, target_path, source_type,
+				source_digest, target_type, link_target, resolved_target
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`, snapshot.ID, item.ID, item.Source, item.Target, item.SourceType,
+			item.SourceDigest, item.TargetType, item.LinkTarget,
+			item.ResolvedTarget); err != nil {
+			return SnapshotRecord{}, fmt.Errorf(
+				"record portable link %s: %w", item.ID, err,
+			)
+		}
+	}
 	for _, collectorError := range inventory.Errors {
 		if _, err := transaction.ExecContext(ctx, `
 			INSERT INTO health_checks(
@@ -403,6 +420,179 @@ func (s *Store) RecordPlan(
 		return PlanRecord{}, fmt.Errorf("commit plan record: %w", err)
 	}
 	return record, nil
+}
+
+func (s *Store) RecordLinkPlan(
+	ctx context.Context,
+	machineID, snapshotID, configDigest, command string,
+	interactive bool,
+	plan portablelink.TransactionPlan,
+) (PlanRecord, error) {
+	if machineID == "" || snapshotID == "" {
+		return PlanRecord{}, errors.New("machine and snapshot ids are required")
+	}
+	if !plan.Ready {
+		return PlanRecord{}, errors.New("cannot record a blocked portable-link plan for apply")
+	}
+	now := time.Now().UTC()
+	runID, err := newID()
+	if err != nil {
+		return PlanRecord{}, err
+	}
+	planID, err := newID()
+	if err != nil {
+		return PlanRecord{}, err
+	}
+	summaryJSON, err := json.Marshal(plan)
+	if err != nil {
+		return PlanRecord{}, fmt.Errorf("encode portable-link plan: %w", err)
+	}
+	warningsJSON, err := json.Marshal(plan.Blockers)
+	if err != nil {
+		return PlanRecord{}, fmt.Errorf("encode portable-link blockers: %w", err)
+	}
+	record := PlanRecord{
+		RunID: runID, PlanID: planID, MachineID: machineID, CreatedAt: now,
+	}
+	transaction, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PlanRecord{}, fmt.Errorf("begin portable-link plan record: %w", err)
+	}
+	defer transaction.Rollback()
+	timestamp := formatTime(now)
+	interactiveValue := 0
+	if interactive {
+		interactiveValue = 1
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO runs(
+			id, machine_id, observed_snapshot_id, command, config_revision,
+			started_at, completed_at, status, interactive
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, runID, machineID, snapshotID, command, configDigest, timestamp, timestamp,
+		"planned", interactiveValue); err != nil {
+		return PlanRecord{}, fmt.Errorf("record portable-link run: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO plans(
+			id, run_id, observed_snapshot_id, desired_digest, created_at, status,
+			summary_json, warnings_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, planID, runID, snapshotID, configDigest, timestamp, "ready",
+		string(summaryJSON), string(warningsJSON)); err != nil {
+		return PlanRecord{}, fmt.Errorf("record portable-link plan: %w", err)
+	}
+	for _, action := range plan.Actions {
+		actionID, err := newID()
+		if err != nil {
+			return PlanRecord{}, err
+		}
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO actions(
+				id, plan_id, sequence, action_type, item_key, risk, reversible,
+				requires_privilege, status, error_summary
+			) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, '')
+		`, actionID, planID, action.Sequence, action.Type, action.LinkID,
+			model.RiskLow, ActionStatusProposed); err != nil {
+			return PlanRecord{}, fmt.Errorf(
+				"record portable-link action %s: %w", action.LinkID, err,
+			)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return PlanRecord{}, fmt.Errorf("commit portable-link plan record: %w", err)
+	}
+	return record, nil
+}
+
+func (s *Store) RecordActionBackup(
+	ctx context.Context,
+	planID string,
+	sequence int,
+	originalPath, backupPath, linkTarget string,
+) error {
+	if planID == "" || sequence <= 0 || originalPath == "" || backupPath == "" {
+		return errors.New("plan, action sequence, and backup paths are required")
+	}
+	var actionID string
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT id FROM actions WHERE plan_id = ? AND sequence = ?
+	`, planID, sequence).Scan(&actionID); err != nil {
+		return fmt.Errorf("find portable-link action for backup: %w", err)
+	}
+	backupID, err := newID()
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256([]byte(linkTarget))
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO backups(
+			id, action_id, original_path, backup_path, content_digest, created_at
+		) VALUES (?, ?, ?, ?, ?, ?)
+	`, backupID, actionID, originalPath, backupPath,
+		hex.EncodeToString(digest[:]), formatTime(time.Now())); err != nil {
+		return fmt.Errorf("record portable-link backup: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) RollBackAction(
+	ctx context.Context,
+	planID string,
+	sequence int,
+	reason string,
+) error {
+	if len(reason) > 1000 {
+		reason = reason[:1000]
+	}
+	transaction, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin action rollback: %w", err)
+	}
+	defer transaction.Rollback()
+	var actionID string
+	if err := transaction.QueryRowContext(ctx, `
+		SELECT id FROM actions WHERE plan_id = ? AND sequence = ?
+	`, planID, sequence).Scan(&actionID); err != nil {
+		return fmt.Errorf("find action for rollback: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		DELETE FROM backups WHERE action_id = ?
+	`, actionID); err != nil {
+		return fmt.Errorf("remove rolled-back backup record: %w", err)
+	}
+	result, err := transaction.ExecContext(ctx, `
+		UPDATE actions
+		SET status = ?, completed_at = ?, error_summary = ?
+		WHERE id = ? AND status IN (?, ?, ?)
+	`, ActionStatusRolledBack, formatTime(time.Now()), reason, actionID,
+		ActionStatusRunning, ActionStatusCompleted, ActionStatusFailed)
+	if err != nil {
+		return fmt.Errorf("mark action rolled back: %w", err)
+	}
+	if err := requireOneRow(result, "action is not rollback-eligible"); err != nil {
+		return err
+	}
+	return transaction.Commit()
+}
+
+func (s *Store) SkipProposedActions(
+	ctx context.Context,
+	planID, reason string,
+) error {
+	if len(reason) > 1000 {
+		reason = reason[:1000]
+	}
+	_, err := s.db.ExecContext(ctx, `
+		UPDATE actions
+		SET status = ?, completed_at = ?, error_summary = ?
+		WHERE plan_id = ? AND status = ?
+	`, ActionStatusSkipped, formatTime(time.Now()), reason, planID,
+		ActionStatusProposed)
+	if err != nil {
+		return fmt.Errorf("skip remaining proposed actions: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) BeginApply(ctx context.Context, runID, planID string) error {

@@ -10,7 +10,11 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Migrations() error = %v", err)
 	}
-	for _, name := range []string{"001_initial.sql", "002_apply_verification.sql"} {
+	for _, name := range []string{
+		"001_initial.sql",
+		"002_apply_verification.sql",
+		"003_portable_links.sql",
+	} {
 		data, err := fs.ReadFile(migrations, name)
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
