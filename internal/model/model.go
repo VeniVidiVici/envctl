@@ -55,7 +55,8 @@ type InstalledPackage struct {
 type LinkKind string
 
 const (
-	LinkKindFile LinkKind = "file"
+	LinkKindFile      LinkKind = "file"
+	LinkKindDirectory LinkKind = "directory"
 )
 
 type LinkSpec struct {
@@ -150,13 +151,14 @@ type CollectorError struct {
 type FindingStatus string
 
 const (
-	FindingSatisfied   FindingStatus = "satisfied"
-	FindingMissing     FindingStatus = "missing"
-	FindingSourceDrift FindingStatus = "source-drift"
-	FindingKindDrift   FindingStatus = "kind-drift"
-	FindingAmbiguous   FindingStatus = "ambiguous"
-	FindingExtra       FindingStatus = "extra"
-	FindingNotChecked  FindingStatus = "not-checked"
+	FindingSatisfied    FindingStatus = "satisfied"
+	FindingMissing      FindingStatus = "missing"
+	FindingSourceDrift  FindingStatus = "source-drift"
+	FindingKindDrift    FindingStatus = "kind-drift"
+	FindingVersionDrift FindingStatus = "version-drift"
+	FindingAmbiguous    FindingStatus = "ambiguous"
+	FindingExtra        FindingStatus = "extra"
+	FindingNotChecked   FindingStatus = "not-checked"
 )
 
 type Finding struct {
@@ -192,6 +194,7 @@ type Action struct {
 	Kind              PackageKind `json:"kind"`
 	Source            string      `json:"source,omitempty"`
 	Package           string      `json:"package"`
+	Version           string      `json:"version,omitempty"`
 	Risk              Risk        `json:"risk"`
 	Reversible        bool        `json:"reversible"`
 	RequiresPrivilege bool        `json:"requires_privilege"`

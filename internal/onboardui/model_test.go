@@ -133,9 +133,9 @@ func TestMatchedViewShowsLocalPlanSummary(t *testing.T) {
 	for _, expected := range []string{
 		"matched example", "10 satisfied", "2 missing", "3 extra",
 		"Proposed package actions: 2", "Portable links: 4 satisfied",
-		"Credential recovery: 3 satisfied", "envctl recovery apply",
-		"Preview only", "--machine example --local --dry-run --json",
-		"envctl links apply",
+		"Credential recovery: 3 satisfied", "Continue with guided setup",
+		"Preview only", "envctl setup --config /config",
+		"--machine example --local",
 	} {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("view does not contain %q:\n%s", expected, content)

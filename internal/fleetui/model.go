@@ -288,6 +288,7 @@ func (m *Model) filteredFindings() []model.Finding {
 			include = finding.Status == model.FindingMissing ||
 				finding.Status == model.FindingSourceDrift ||
 				finding.Status == model.FindingKindDrift ||
+				finding.Status == model.FindingVersionDrift ||
 				finding.Status == model.FindingAmbiguous
 		case "extra":
 			include = finding.Status == model.FindingExtra
@@ -429,7 +430,8 @@ func statusLabel(status model.FindingStatus) string {
 		return "ok"
 	case model.FindingMissing:
 		return "missing"
-	case model.FindingSourceDrift, model.FindingKindDrift:
+	case model.FindingSourceDrift, model.FindingKindDrift,
+		model.FindingVersionDrift:
 		return "drift"
 	case model.FindingAmbiguous:
 		return "ambiguous"

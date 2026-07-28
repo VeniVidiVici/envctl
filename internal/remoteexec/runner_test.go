@@ -85,6 +85,44 @@ func TestRunnerBuildsExactBunGlobalCommand(t *testing.T) {
 	}
 }
 
+func TestRunnerBuildsExactMiseInstallCommand(t *testing.T) {
+	commandRunner := &fakeCommandRunner{}
+	runner := Runner{host: "remote-mac", runner: commandRunner}
+	if _, _, err := runner.Run(
+		context.Background(),
+		"mise", "install", "--yes", "node@24",
+	); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	command := commandRunner.args[len(commandRunner.args)-1]
+	want := "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH " +
+		"mise install --yes node@24"
+	if command != want {
+		t.Fatalf("remote command = %q, want %q", command, want)
+	}
+}
+
+func TestRunnerRejectsUnsafeMiseCommands(t *testing.T) {
+	tests := [][]string{
+		{"install", "node@24"},
+		{"install", "--yes", "--jobs@24"},
+		{"install", "--yes", "node@24;uname"},
+		{"install", "--yes", "node@../24"},
+	}
+	for _, args := range tests {
+		commandRunner := &fakeCommandRunner{}
+		runner := Runner{host: "remote-mac", runner: commandRunner}
+		if _, _, err := runner.Run(
+			context.Background(), "mise", args...,
+		); err == nil {
+			t.Fatalf("Run(%#v) error = nil, want rejection", args)
+		}
+		if commandRunner.name != "" {
+			t.Fatalf("command ran for %#v", args)
+		}
+	}
+}
+
 func TestRunnerRejectsUnsafeBunCommands(t *testing.T) {
 	tests := [][]string{
 		{"install", "--global", "--ignore-scripts", "--no-progress", "--no-summary", "x"},

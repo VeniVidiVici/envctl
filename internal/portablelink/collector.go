@@ -1,12 +1,11 @@
 package portablelink
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"os"
 	"path/filepath"
 	"sort"
 
+	"github.com/VeniVidiVici/envctl/internal/contentdigest"
 	"github.com/VeniVidiVici/envctl/internal/model"
 )
 
@@ -19,13 +18,20 @@ func Collect(specs []model.LinkSpec) []model.LinkObservation {
 			Target: spec.Target,
 		}
 		observation.SourceType, _, _ = inspect(spec.Source)
-		if observation.SourceType == "file" {
-			if raw, err := os.ReadFile(spec.Source); err == nil {
-				digest := sha256.Sum256(raw)
-				observation.SourceDigest = hex.EncodeToString(digest[:])
-			} else {
-				observation.SourceType = "unreadable"
-			}
+		var digest string
+		var err error
+		switch spec.Kind {
+		case model.LinkKindFile:
+			digest, err = contentdigest.File(spec.Source)
+		case model.LinkKindDirectory:
+			digest, err = contentdigest.Directory(spec.Source)
+		default:
+			err = os.ErrInvalid
+		}
+		if err != nil {
+			observation.SourceType = "unreadable"
+		} else {
+			observation.SourceDigest = digest
 		}
 		observation.TargetType, observation.LinkTarget,
 			observation.ResolvedTarget = inspect(spec.Target)

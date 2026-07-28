@@ -35,9 +35,12 @@ func BuildLinks(
 		}
 		finding.Observed = linkObservationPointer(actual)
 		switch {
-		case actual.SourceType != "file":
+		case (wanted.Kind != model.LinkKindDirectory &&
+			actual.SourceType != "file") ||
+			(wanted.Kind == model.LinkKindDirectory &&
+				actual.SourceType != "directory"):
 			finding.Status = model.LinkFindingSourceAbsent
-			finding.Detail = "portable source is not a regular file on the target machine"
+			finding.Detail = "portable source does not match the declared kind on the target machine"
 			summary.Drifted++
 		case wanted.Digest == "" || actual.SourceDigest != wanted.Digest:
 			finding.Status = model.LinkFindingSourceDrift

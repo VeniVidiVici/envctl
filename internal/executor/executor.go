@@ -23,6 +23,8 @@ var (
 	bunPackagePattern = regexp.MustCompile(
 		`^(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*$`,
 	)
+	miseToolPattern    = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9+._-]*$`)
+	miseVersionPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9.+_-]*$`)
 )
 
 type Runner interface {
@@ -179,9 +181,33 @@ func commandFor(action model.Action) (Command, error) {
 		return homebrewCommand(action)
 	case model.ManagerBun:
 		return bunCommand(action)
+	case model.ManagerMise:
+		return miseCommand(action)
 	default:
 		return Command{}, fmt.Errorf("unsupported manager %q", action.Manager)
 	}
+}
+
+func miseCommand(action model.Action) (Command, error) {
+	if action.Kind != model.KindTool {
+		return Command{}, fmt.Errorf("unsupported Mise kind %q", action.Kind)
+	}
+	if action.Source != "" {
+		return Command{}, fmt.Errorf("unsupported Mise source %q", action.Source)
+	}
+	if !miseToolPattern.MatchString(action.Package) ||
+		!miseVersionPattern.MatchString(action.Version) {
+		return Command{}, fmt.Errorf(
+			"unsafe Mise tool identity %q@%q", action.Package, action.Version,
+		)
+	}
+	return Command{
+		Sequence: action.Sequence, PackageID: action.PackageID,
+		Name: "mise",
+		Args: []string{
+			"install", "--yes", action.Package + "@" + action.Version,
+		},
+	}, nil
 }
 
 func homebrewCommand(action model.Action) (Command, error) {

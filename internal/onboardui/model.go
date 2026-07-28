@@ -200,45 +200,15 @@ func (m *Model) View() tea.View {
 				"Preview only: onboarding has not applied these actions.",
 			))
 			body.WriteString("\n")
-			body.WriteString("\nNext dry-run:\n")
+			body.WriteString("\nContinue with guided setup:\n")
 			body.WriteString(fmt.Sprintf(
-				"  envctl apply --config %s \\\n",
+				"  envctl setup --config %s \\\n",
 				m.configRoot,
 			))
 			body.WriteString(fmt.Sprintf(
-				"    --machine %s --local --dry-run --json\n",
+				"    --machine %s --local\n",
 				m.result.MachineID,
 			))
-			if m.result.Plan.LinkSummary != nil {
-				links := m.result.Plan.LinkSummary
-				if links.Missing+links.Drifted+links.NotChecked > 0 {
-					body.WriteString("\nPortable-link dry-run:\n")
-					body.WriteString(fmt.Sprintf(
-						"  envctl links apply --config %s \\\n",
-						m.configRoot,
-					))
-					body.WriteString(fmt.Sprintf(
-						"    --machine %s --local --dry-run --json\n",
-						m.result.MachineID,
-					))
-				}
-			}
-			if m.result.RecoveryPlan != nil {
-				recovery := m.result.RecoveryPlan.Summary
-				if recovery.Missing+recovery.Drifted+recovery.Blocked+
-					recovery.ToolMissing+recovery.SourceMissing+
-					recovery.SourceUnsafe > 0 {
-					body.WriteString("\nCredential recovery plan:\n")
-					body.WriteString(fmt.Sprintf(
-						"  envctl recovery apply --config %s \\\n",
-						m.configRoot,
-					))
-					body.WriteString(fmt.Sprintf(
-						"    --machine %s --local --json --dry-run\n",
-						m.result.MachineID,
-					))
-				}
-			}
 		}
 	} else if m.result.Proposal != nil {
 		body.WriteString(fmt.Sprintf(

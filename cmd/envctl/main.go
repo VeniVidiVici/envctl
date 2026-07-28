@@ -25,6 +25,7 @@ import (
 	"github.com/VeniVidiVici/envctl/internal/homebrew"
 	"github.com/VeniVidiVici/envctl/internal/legacy"
 	"github.com/VeniVidiVici/envctl/internal/mas"
+	"github.com/VeniVidiVici/envctl/internal/mise"
 	"github.com/VeniVidiVici/envctl/internal/model"
 	"github.com/VeniVidiVici/envctl/internal/onboard"
 	"github.com/VeniVidiVici/envctl/internal/onboardui"
@@ -33,6 +34,7 @@ import (
 	"github.com/VeniVidiVici/envctl/internal/recovery"
 	"github.com/VeniVidiVici/envctl/internal/remoteexec"
 	"github.com/VeniVidiVici/envctl/internal/runtimepath"
+	"github.com/VeniVidiVici/envctl/internal/setupui"
 	"github.com/VeniVidiVici/envctl/internal/stateboundary"
 	"github.com/VeniVidiVici/envctl/internal/store"
 )
@@ -42,11 +44,12 @@ const usage = `envctl is a read-first macOS environment manager.
 Usage:
   envctl audit --json [--state PATH] [--no-record]
   envctl onboard --config DIR [--json] [--machine ID] [--profiles A,B]
+  envctl setup --config DIR --machine ID --local [--json]
   envctl import-legacy --input PATH
   envctl config validate --config DIR --json
   envctl config resolve --config DIR --machine ID --json
   envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
-  envctl apply --config DIR --machine ID [--local] [--manager brew|bun|mas] --json (--dry-run | --yes)
+  envctl apply --config DIR --machine ID [--local] [--manager brew|mise|bun|mas] --json (--dry-run | --yes)
   envctl links apply --config DIR --machine ID --local --json (--dry-run | --yes)
   envctl recovery plan --config DIR --machine ID --local --json
   envctl recovery apply --config DIR --machine ID --local --json (--dry-run | --yes)
@@ -78,6 +81,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runAudit(ctx, args[1:], stdout, stderr)
 	case "onboard":
 		return runOnboard(ctx, args[1:], stdout, stderr)
+	case "setup":
+		return runSetup(ctx, args[1:], stdout, stderr)
 	case "import-legacy":
 		return runImportLegacy(args[1:], stdout, stderr)
 	case "plan":
@@ -102,6 +107,355 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
+}
+
+type setupResponse struct {
+	MachineID    string          `json:"machine_id"`
+	ConfigDigest string          `json:"config_digest"`
+	Phases       []setupui.Phase `json:"phases"`
+}
+
+func runSetup(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("setup", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineID := flags.String("machine", "", "machine id from the native config")
+	localMachine := flags.Bool(
+		"local",
+		false,
+		"require this Mac's registered identity and execute phases locally",
+	)
+	asJSON := flags.Bool("json", false, "print the unified setup plan as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" || *machineID == "" {
+		return errors.New("--config and --machine are required")
+	}
+	if !*localMachine {
+		return errors.New("setup currently requires --local")
+	}
+	loaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	if err := forceLocalMachine(ctx, &loaded); err != nil {
+		return err
+	}
+	phases, err := buildSetupPhases(ctx, loaded)
+	if err != nil {
+		return err
+	}
+	response := setupResponse{
+		MachineID: loaded.Machine.ID, ConfigDigest: loaded.Digest,
+		Phases: phases,
+	}
+	if *asJSON {
+		return encodeJSON(stdout, response)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate envctl executable: %w", err)
+	}
+	return setupui.Run(setupui.New(
+		loaded.Machine.ID,
+		phases,
+		setupui.ProcessFactory{Context: ctx, Executable: executable},
+	))
+}
+
+func buildSetupPhases(
+	ctx context.Context,
+	loaded envconfig.Loaded,
+) ([]setupui.Phase, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("find home directory: %w", err)
+	}
+	recoveryPhase, err := buildRecoverySetupPhase(ctx, home, loaded)
+	if err != nil {
+		return nil, err
+	}
+	linkPhase, err := buildLinkSetupPhase(home, loaded)
+	if err != nil {
+		return nil, err
+	}
+	inventory, err := collectMachineInventory(ctx, loaded)
+	if err != nil {
+		return nil, fmt.Errorf("collect local setup inventory: %w", err)
+	}
+	packagePlan := planInventory(
+		loaded.Desired.Packages,
+		loaded.Desired.Links,
+		inventory,
+	)
+	phases := []setupui.Phase{recoveryPhase, linkPhase}
+	phases = append(
+		phases,
+		buildManagerSetupPhase(
+			loaded,
+			inventory,
+			packagePlan,
+			model.ManagerBrew,
+			setupui.PhaseHomebrew,
+			"Homebrew packages",
+			"Install missing declared formulae and casks.",
+			[]setupui.PhaseID{setupui.PhaseRecovery, setupui.PhaseLinks},
+			true,
+		),
+		buildManagerSetupPhase(
+			loaded,
+			inventory,
+			packagePlan,
+			model.ManagerMise,
+			setupui.PhaseMise,
+			"Mise runtimes",
+			"Install declared runtimes before language-level tools.",
+			[]setupui.PhaseID{
+				setupui.PhaseRecovery,
+				setupui.PhaseLinks,
+				setupui.PhaseHomebrew,
+			},
+			true,
+		),
+		buildManagerSetupPhase(
+			loaded,
+			inventory,
+			packagePlan,
+			model.ManagerBun,
+			setupui.PhaseBun,
+			"Bun global tools",
+			"Install declared global tools after Homebrew prerequisites.",
+			[]setupui.PhaseID{setupui.PhaseMise},
+			true,
+		),
+		buildManagerSetupPhase(
+			loaded,
+			inventory,
+			packagePlan,
+			model.ManagerMAS,
+			setupui.PhaseMAS,
+			"Mac App Store review",
+			"Run the read-only compatibility and account preflight; App Store installation remains manual.",
+			[]setupui.PhaseID{setupui.PhaseHomebrew},
+			false,
+		),
+		buildManualSetupPhase(packagePlan),
+	)
+	return phases, nil
+}
+
+func buildRecoverySetupPhase(
+	ctx context.Context,
+	home string,
+	loaded envconfig.Loaded,
+) (setupui.Phase, error) {
+	phase := setupui.Phase{
+		ID:          setupui.PhaseRecovery,
+		Label:       "Credential recovery",
+		Description: "Restore encrypted machine-local credentials before configuration and package work.",
+		Status:      setupui.StatusSatisfied,
+	}
+	if len(loaded.Desired.Recoveries) == 0 {
+		phase.Description = "No credential recovery groups are declared."
+		return phase, nil
+	}
+	transaction, err := recovery.NewTransaction(
+		home,
+		filepath.Join(
+			home, ".local", "state", "envctl", "backups", "recovery",
+		),
+		filepath.Join(
+			home, ".local", "state", "envctl", "staging", "recovery",
+		),
+	)
+	if err != nil {
+		return setupui.Phase{}, err
+	}
+	plan, _, err := transaction.Plan(ctx, loaded.Desired.Recoveries)
+	if err != nil {
+		return setupui.Phase{}, err
+	}
+	phase.Actions = len(plan.Actions)
+	phase.Blockers = len(plan.Blockers)
+	switch {
+	case phase.Blockers > 0:
+		phase.Status = setupui.StatusBlocked
+	case phase.Actions > 0:
+		phase.Status = setupui.StatusReady
+		phase.Command = localSetupCommand(
+			"recovery", "apply", loaded.Root, loaded.Machine.ID, "",
+			true,
+		)
+	}
+	return phase, nil
+}
+
+func buildLinkSetupPhase(
+	home string,
+	loaded envconfig.Loaded,
+) (setupui.Phase, error) {
+	phase := setupui.Phase{
+		ID:           setupui.PhaseLinks,
+		Label:        "Portable configuration",
+		Description:  "Create verified links to portable configuration files.",
+		Status:       setupui.StatusSatisfied,
+		Dependencies: []setupui.PhaseID{setupui.PhaseRecovery},
+	}
+	if len(loaded.Desired.Links) == 0 {
+		phase.Description = "No portable configuration links are declared."
+		return phase, nil
+	}
+	transaction, err := portablelink.NewTransaction(
+		home,
+		filepath.Join(
+			home, ".local", "state", "envctl", "backups", "portable-links",
+		),
+	)
+	if err != nil {
+		return setupui.Phase{}, err
+	}
+	plan, err := transaction.Plan(loaded.Desired.Links)
+	if err != nil {
+		return setupui.Phase{}, err
+	}
+	phase.Actions = len(plan.Actions)
+	phase.Blockers = len(plan.Blockers)
+	switch {
+	case phase.Blockers > 0:
+		phase.Status = setupui.StatusBlocked
+	case phase.Actions > 0:
+		phase.Status = setupui.StatusReady
+		phase.Command = localSetupCommand(
+			"links", "apply", loaded.Root, loaded.Machine.ID, "", true,
+		)
+	}
+	return phase, nil
+}
+
+func buildManagerSetupPhase(
+	loaded envconfig.Loaded,
+	inventory model.Inventory,
+	plan model.Plan,
+	manager model.Manager,
+	id setupui.PhaseID,
+	label, description string,
+	dependencies []setupui.PhaseID,
+	mutating bool,
+) setupui.Phase {
+	phase := setupui.Phase{
+		ID: id, Label: label, Description: description,
+		Status: setupui.StatusSatisfied, Dependencies: dependencies,
+	}
+	desiredCount := desiredManagerCount(loaded.Desired.Packages, manager)
+	if desiredCount == 0 {
+		phase.Description = "No desired items are declared for this manager."
+		return phase
+	}
+	selected, _ := selectActions(plan.Actions, manager)
+	phase.Actions = len(selected)
+	collector := collectorForApply(manager)
+	if !hasCollector(inventory, collector) {
+		phase.Actions = desiredCount
+		if manager == model.ManagerMAS {
+			phase.Status = setupui.StatusReview
+		} else {
+			phase.Status = setupui.StatusReady
+		}
+		phase.Description += " Current inventory is unavailable; this phase replans after its prerequisites."
+	} else if manager == model.ManagerMAS {
+		if len(selected) > 0 {
+			phase.Status = setupui.StatusReview
+		}
+	} else {
+		_, blocked := classifyActions(selected)
+		phase.Blockers = len(blocked)
+		switch {
+		case phase.Blockers > 0:
+			phase.Status = setupui.StatusBlocked
+		case phase.Actions > 0:
+			phase.Status = setupui.StatusReady
+		}
+	}
+	if phase.Status == setupui.StatusReady ||
+		phase.Status == setupui.StatusReview {
+		phase.Command = localSetupCommand(
+			"apply", "", loaded.Root, loaded.Machine.ID, manager, mutating,
+		)
+	}
+	return phase
+}
+
+func buildManualSetupPhase(
+	plan model.Plan,
+) setupui.Phase {
+	phase := setupui.Phase{
+		ID:           setupui.PhaseManual,
+		Label:        "Manual and external tools",
+		Description:  "Review desired tools whose installers are intentionally outside envctl's execution boundary.",
+		Status:       setupui.StatusSatisfied,
+		Dependencies: []setupui.PhaseID{setupui.PhaseHomebrew, setupui.PhaseBun},
+	}
+	for _, finding := range plan.Findings {
+		if finding.Desired == nil {
+			continue
+		}
+		switch finding.Desired.Manager {
+		case model.ManagerBrew, model.ManagerBun, model.ManagerMAS:
+			continue
+		}
+		if finding.Status != model.FindingSatisfied {
+			phase.Actions++
+		}
+	}
+	if phase.Actions > 0 {
+		phase.Status = setupui.StatusBlocked
+		phase.Blockers = phase.Actions
+	}
+	return phase
+}
+
+func desiredManagerCount(
+	desired []model.PackageSpec,
+	manager model.Manager,
+) int {
+	count := 0
+	for _, item := range desired {
+		if item.Manager == manager {
+			count++
+		}
+	}
+	return count
+}
+
+func localSetupCommand(
+	command, subcommand, configRoot, machineID string,
+	manager model.Manager,
+	mutating bool,
+) []string {
+	arguments := []string{command}
+	if subcommand != "" {
+		arguments = append(arguments, subcommand)
+	}
+	arguments = append(
+		arguments,
+		"--config", configRoot,
+		"--machine", machineID,
+		"--local",
+	)
+	if manager != "" {
+		arguments = append(arguments, "--manager", string(manager))
+	}
+	if mutating {
+		arguments = append(arguments, "--yes")
+	} else {
+		arguments = append(arguments, "--dry-run")
+	}
+	return append(arguments, "--json")
 }
 
 func runOnboard(
@@ -933,7 +1287,7 @@ func runApply(
 	configRoot := flags.String("config", "", "native env-config directory")
 	machineID := flags.String("machine", "", "machine id from the native config")
 	managerName := flags.String(
-		"manager", "", "limit apply to one supported manager: brew, bun, or mas",
+		"manager", "", "limit apply to one supported manager: brew, mise, bun, or mas",
 	)
 	localMachine := flags.Bool(
 		"local", false,
@@ -1193,11 +1547,12 @@ func parseApplyManager(value string) (model.Manager, error) {
 	switch model.Manager(value) {
 	case "":
 		return "", nil
-	case model.ManagerBrew, model.ManagerBun, model.ManagerMAS:
+	case model.ManagerBrew, model.ManagerMise,
+		model.ManagerBun, model.ManagerMAS:
 		return model.Manager(value), nil
 	default:
 		return "", fmt.Errorf(
-			"unsupported --manager %q; expected brew, bun, or mas", value,
+			"unsupported --manager %q; expected brew, mise, bun, or mas", value,
 		)
 	}
 }
@@ -1205,6 +1560,9 @@ func parseApplyManager(value string) (model.Manager, error) {
 func collectorForApply(manager model.Manager) string {
 	if manager == model.ManagerBun {
 		return "bun"
+	}
+	if manager == model.ManagerMise {
+		return "mise"
 	}
 	if manager == model.ManagerMAS {
 		return "mas"
@@ -2028,6 +2386,7 @@ func collectInventory(
 
 	collect("homebrew", homebrew.NewCollector(homebrew.ExecRunner{}).Collect)
 	collect("mas", mas.NewCollector(mas.ExecRunner{}).Collect)
+	collect("mise", mise.NewCollector(mise.ExecRunner{}).Collect)
 	bunCollector, err := bun.DefaultCollector()
 	if err != nil {
 		inventory.Errors = append(inventory.Errors, model.CollectorError{
@@ -2094,7 +2453,9 @@ func decodeLinkSpecs(encoded string) ([]model.LinkSpec, error) {
 	}
 	for _, spec := range specs {
 		decodedDigest, digestErr := hex.DecodeString(spec.Digest)
-		if spec.ID == "" || spec.Kind != model.LinkKindFile ||
+		if spec.ID == "" ||
+			(spec.Kind != model.LinkKindFile &&
+				spec.Kind != model.LinkKindDirectory) ||
 			!pathWithin(home, spec.Source) || !pathWithin(home, spec.Target) ||
 			digestErr != nil || len(decodedDigest) != sha256.Size {
 			return nil, fmt.Errorf("unsafe portable link specification %q", spec.ID)
@@ -2122,6 +2483,8 @@ func collectedManagers(inventory model.Inventory) []model.Manager {
 			managers = append(managers, model.ManagerMAS)
 		case "bun":
 			managers = append(managers, model.ManagerBun)
+		case "mise":
+			managers = append(managers, model.ManagerMise)
 		case "custom":
 			managers = append(managers, model.ManagerCustom)
 		}
