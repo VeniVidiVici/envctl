@@ -138,6 +138,7 @@ type Inventory struct {
 	Collectors  []string           `json:"collectors"`
 	Packages    []InstalledPackage `json:"packages"`
 	Links       []LinkObservation  `json:"links,omitempty"`
+	Recoveries  []RecoveryFinding  `json:"recoveries,omitempty"`
 	Errors      []CollectorError   `json:"errors,omitempty"`
 }
 

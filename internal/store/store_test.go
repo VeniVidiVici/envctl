@@ -9,6 +9,7 @@ import (
 
 	"github.com/VeniVidiVici/envctl/internal/model"
 	"github.com/VeniVidiVici/envctl/internal/portablelink"
+	"github.com/VeniVidiVici/envctl/internal/recovery"
 )
 
 func TestRecordsAuditPlanAndHistory(t *testing.T) {
@@ -111,8 +112,125 @@ func TestOpenAppliesMigrationsIdempotently(t *testing.T) {
 	if err := second.db.QueryRow("SELECT COUNT(*) FROM schema_migrations").Scan(&count); err != nil {
 		t.Fatal(err)
 	}
-	if count != 3 {
-		t.Fatalf("migration count = %d, want 3", count)
+	if count != 4 {
+		t.Fatalf("migration count = %d, want 4", count)
+	}
+}
+
+func TestRecordsCredentialRecoveryLifecycleWithoutSecretDigests(t *testing.T) {
+	state, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	ctx := context.Background()
+	machine := MachineInfo{ID: "example-machine", Hostname: "example-machine"}
+	before, err := state.RecordAudit(ctx, machine, model.Inventory{
+		CollectedAt: time.Now().UTC(),
+		Collectors:  []string{"credential-recovery"},
+		Recoveries: []model.RecoveryFinding{{
+			RecoveryID: "aws", Kind: model.RecoveryKindSOPSFile,
+			Target: "/home/.aws/credentials",
+			Status: model.RecoveryFindingDrifted,
+			Detail: "credential target differs from the encrypted desired source",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := recovery.TransactionPlan{
+		RunID: "recovery-run", Ready: true,
+		Actions: []recovery.RecoveryAction{{
+			Sequence: 1, RecoveryID: "aws",
+			Kind:       model.RecoveryKindSOPSFile,
+			Type:       recovery.ActionRestore,
+			Target:     "/home/.aws/credentials",
+			BackupPath: "/home/.local/state/envctl/backups/recovery/run/.aws/credentials",
+		}},
+	}
+	record, err := state.RecordRecoveryPlan(
+		ctx,
+		machine.ID,
+		before.ID,
+		"digest",
+		"recovery apply",
+		false,
+		plan,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.BeginApply(ctx, record.RunID, record.PlanID); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.StartAction(ctx, record.PlanID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.RecordRecoveryBackup(
+		ctx,
+		record.PlanID,
+		1,
+		"/home/.aws/credentials",
+		"/home/.local/state/envctl/backups/recovery/run/.aws/credentials",
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.FinishAction(
+		ctx,
+		record.PlanID,
+		1,
+		ActionStatusCompleted,
+		"",
+	); err != nil {
+		t.Fatal(err)
+	}
+	after, err := state.RecordAudit(ctx, machine, model.Inventory{
+		CollectedAt: time.Now().UTC(),
+		Collectors:  []string{"credential-recovery"},
+		Recoveries: []model.RecoveryFinding{{
+			RecoveryID: "aws", Kind: model.RecoveryKindSOPSFile,
+			Target: "/home/.aws/credentials",
+			Status: model.RecoveryFindingSatisfied,
+			Detail: "credential target matches the decryptable desired source",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := state.CompleteApply(
+		ctx,
+		record.RunID,
+		record.PlanID,
+		after.ID,
+		ActionStatusCompleted,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var recoveryRows, backupRows int
+	var digest string
+	if err := state.db.QueryRow(
+		"SELECT COUNT(*) FROM recovery_inventory_items",
+	).Scan(&recoveryRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.db.QueryRow(
+		"SELECT COUNT(*) FROM backups",
+	).Scan(&backupRows); err != nil {
+		t.Fatal(err)
+	}
+	if err := state.db.QueryRow(
+		"SELECT content_digest FROM backups LIMIT 1",
+	).Scan(&digest); err != nil {
+		t.Fatal(err)
+	}
+	if recoveryRows != 2 || backupRows != 1 ||
+		digest != "secret-digest-intentionally-not-recorded" {
+		t.Fatalf(
+			"recovery rows = %d backup rows = %d digest = %q",
+			recoveryRows,
+			backupRows,
+			digest,
+		)
 	}
 }
 

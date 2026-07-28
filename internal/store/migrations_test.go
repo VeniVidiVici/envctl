@@ -14,6 +14,7 @@ func TestMigrationsAreEmbedded(t *testing.T) {
 		"001_initial.sql",
 		"002_apply_verification.sql",
 		"003_portable_links.sql",
+		"004_recovery_inventory.sql",
 	} {
 		data, err := fs.ReadFile(migrations, name)
 		if err != nil {

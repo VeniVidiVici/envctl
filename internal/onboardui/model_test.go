@@ -29,16 +29,16 @@ func (w *fakeWriter) Write(
 }
 
 func TestNeedsConfirmationWritesOnlyAfterY(t *testing.T) {
-	writer := &fakeWriter{path: "machines/ai.yaml"}
+	writer := &fakeWriter{path: "machines/example-mac.yaml"}
 	model := New(onboard.Result{
 		Status:    onboard.StatusNeedsConfirmation,
-		MachineID: "ai",
+		MachineID: "example-mac",
 		Proposal: &envconfig.Machine{
-			ID:       "ai",
+			ID:       "example-mac",
 			Profiles: []string{"shared"},
 			Access:   envconfig.Access{Type: "local"},
 		},
-		ProposalPath:      "machines/ai.yaml",
+		ProposalPath:      "machines/example-mac.yaml",
 		AvailableProfiles: []string{"shared"},
 	}, "/config", writer)
 
@@ -51,10 +51,10 @@ func TestNeedsConfirmationWritesOnlyAfterY(t *testing.T) {
 		t.Fatal("confirmation produced no write command")
 	}
 	model.Update(command())
-	if writer.machine.ID != "ai" || !writer.replace {
+	if writer.machine.ID != "example-mac" || !writer.replace {
 		t.Fatalf("writer = %#v", writer)
 	}
-	if !strings.Contains(model.statusMessage, "machines/ai.yaml") {
+	if !strings.Contains(model.statusMessage, "machines/example-mac.yaml") {
 		t.Fatalf("status = %q", model.statusMessage)
 	}
 }
@@ -133,7 +133,7 @@ func TestMatchedViewShowsLocalPlanSummary(t *testing.T) {
 	for _, expected := range []string{
 		"matched example", "10 satisfied", "2 missing", "3 extra",
 		"Proposed package actions: 2", "Portable links: 4 satisfied",
-		"Credential recovery: 3 satisfied", "envctl recovery plan",
+		"Credential recovery: 3 satisfied", "envctl recovery apply",
 		"Preview only", "--machine example --local --dry-run --json",
 		"envctl links apply",
 	} {
