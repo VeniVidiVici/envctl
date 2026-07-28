@@ -186,9 +186,17 @@ verify_foundation() {
 	sops decrypt \
 		--output-type dotenv \
 		"$ENV_CONFIG_CHECKOUT/secrets/shell.sops.env" >/dev/null
-	"$ENVCTL_BINARY" config validate \
-		--config "$ENV_CONFIG_CHECKOUT" \
-		--json >/dev/null
+	if "$ENVCTL_BINARY" help | grep -Fq "envctl config validate"; then
+		"$ENVCTL_BINARY" config validate \
+			--config "$ENV_CONFIG_CHECKOUT" \
+			--json >/dev/null
+	else
+		# Supports a bootstrap script synced before its envctl PR is merged.
+		"$ENVCTL_BINARY" config resolve \
+			--config "$ENV_CONFIG_CHECKOUT" \
+			--machine ai \
+			--json >/dev/null
+	fi
 	"$ENVCTL_BINARY" audit --json --no-record \
 		>"$BOOTSTRAP_STATE/initial-audit.json"
 }
