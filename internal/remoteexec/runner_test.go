@@ -9,7 +9,7 @@ import (
 
 func TestRunnerBuildsStrictNonInteractiveSSHCommand(t *testing.T) {
 	commandRunner := &fakeCommandRunner{}
-	runner := Runner{host: "macbook-pro", runner: commandRunner}
+	runner := Runner{host: "example-mac", runner: commandRunner}
 	if _, _, err := runner.Run(
 		context.Background(),
 		"brew", "install", "--formula", "hashicorp/tap/terraform",
@@ -22,7 +22,7 @@ func TestRunnerBuildsStrictNonInteractiveSSHCommand(t *testing.T) {
 		"-o", "ControlMaster=no",
 		"-o", "ControlPath=none",
 		"-o", "ConnectTimeout=8",
-		"macbook-pro",
+		"example-mac",
 		"PATH=/opt/homebrew/bin:/usr/local/bin:$PATH " +
 			"HOMEBREW_NO_AUTO_UPDATE=1 " +
 			"brew install --formula hashicorp/tap/terraform",
@@ -68,7 +68,7 @@ func TestRunnerRejectsAnythingOutsideNarrowHomebrewInstall(t *testing.T) {
 
 func TestRunnerBuildsExactBunGlobalCommand(t *testing.T) {
 	commandRunner := &fakeCommandRunner{}
-	runner := Runner{host: "matilda", runner: commandRunner}
+	runner := Runner{host: "remote-mac", runner: commandRunner}
 	if _, _, err := runner.Run(
 		context.Background(),
 		"bun",
@@ -94,7 +94,7 @@ func TestRunnerRejectsUnsafeBunCommands(t *testing.T) {
 	}
 	for _, args := range tests {
 		commandRunner := &fakeCommandRunner{}
-		runner := Runner{host: "matilda", runner: commandRunner}
+		runner := Runner{host: "remote-mac", runner: commandRunner}
 		if _, _, err := runner.Run(
 			context.Background(), "bun", args...,
 		); err == nil {
@@ -124,7 +124,7 @@ func TestRunnerAllowsOnlyReadOnlyMASPreflightCommands(t *testing.T) {
 	}
 	for _, test := range tests {
 		commandRunner := &fakeCommandRunner{}
-		runner := Runner{host: "matilda", runner: commandRunner}
+		runner := Runner{host: "remote-mac", runner: commandRunner}
 		if _, _, err := runner.Run(
 			context.Background(), test.name, test.args...,
 		); err != nil {
@@ -146,7 +146,7 @@ func TestRunnerRejectsStateChangingMASCommands(t *testing.T) {
 	}
 	for _, args := range tests {
 		commandRunner := &fakeCommandRunner{}
-		runner := Runner{host: "matilda", runner: commandRunner}
+		runner := Runner{host: "remote-mac", runner: commandRunner}
 		if _, _, err := runner.Run(
 			context.Background(), "mas", args...,
 		); err == nil {

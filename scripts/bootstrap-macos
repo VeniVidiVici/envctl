@@ -192,9 +192,18 @@ verify_foundation() {
 			--json >/dev/null
 	else
 		# Supports a bootstrap script synced before its envctl PR is merged.
+		local fallback_machine_file
+		local fallback_machine
+		fallback_machine_file="$(
+			find "$ENV_CONFIG_CHECKOUT/machines" -maxdepth 1 -type f \
+				-name '*.yaml' -print | sort | head -n 1
+		)"
+		[[ -n "$fallback_machine_file" ]] ||
+			fail "No machine files are available for fallback validation"
+		fallback_machine="$(basename "$fallback_machine_file" .yaml)"
 		"$ENVCTL_BINARY" config resolve \
 			--config "$ENV_CONFIG_CHECKOUT" \
-			--machine ai \
+			--machine "$fallback_machine" \
 			--json >/dev/null
 	fi
 	"$ENVCTL_BINARY" audit --json --no-record \

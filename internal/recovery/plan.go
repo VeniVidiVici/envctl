@@ -292,13 +292,13 @@ func (p *Planner) inspectGPGKeyring(
 		return model.RecoveryFindingBlocked,
 			"GPG keyring is not a real machine-local directory"
 	}
-	if info.Mode().Perm() != 0o700 {
-		return model.RecoveryFindingDrifted, "GPG keyring mode is not 0700"
-	}
 	installed, err := p.gpgSecretFingerprint(ctx, gpg, spec.Target, spec.Fingerprint)
 	if err != nil || installed != spec.Fingerprint {
 		return model.RecoveryFindingMissing,
 			"expected GPG secret key is not installed"
+	}
+	if info.Mode().Perm() != 0o700 {
+		return model.RecoveryFindingDrifted, "GPG keyring mode is not 0700"
 	}
 	return model.RecoveryFindingSatisfied,
 		"expected GPG secret key is installed in the machine-local keyring"
@@ -485,11 +485,30 @@ func (p *Planner) ageArchiveDigests(
 func (p *Planner) gpgPublicFingerprint(
 	ctx context.Context,
 	gpg, source string,
-) (string, error) {
+) (fingerprint string, returnErr error) {
+	scratch, err := os.MkdirTemp("", "envctl-gpg-inspect-*")
+	if err != nil {
+		return "", err
+	}
+	if err := os.Chmod(scratch, 0o700); err != nil {
+		_ = os.RemoveAll(scratch)
+		return "", err
+	}
+	defer func() {
+		if err := os.RemoveAll(scratch); err != nil {
+			returnErr = errors.Join(
+				returnErr,
+				fmt.Errorf("remove temporary GPG inspection home: %w", err),
+			)
+		}
+	}()
 	command := p.command(
 		ctx,
 		gpg,
 		"--batch",
+		"--no-options",
+		"--homedir",
+		scratch,
 		"--with-colons",
 		"--show-keys",
 		"--fingerprint",

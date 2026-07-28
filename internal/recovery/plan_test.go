@@ -182,6 +182,83 @@ printf '%s\n' 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:'
 	}
 }
 
+func TestPlannerPublicGPGInspectionDoesNotCreateKeyring(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	fingerprint := strings.Repeat("A", 40)
+	writeRecoveryFile(
+		t,
+		filepath.Join(home, ".config", "sops", "age", "keys.txt"),
+		"identity",
+		0o600,
+	)
+	recoveryDirectory := filepath.Join(home, "recovery")
+	public := writeRecoveryFile(
+		t,
+		filepath.Join(recoveryDirectory, "public.asc"),
+		"public",
+		0o600,
+	)
+	private := writeRecoveryFile(
+		t,
+		filepath.Join(recoveryDirectory, "private.asc.age"),
+		"private",
+		0o600,
+	)
+	ownertrust := writeRecoveryFile(
+		t,
+		filepath.Join(recoveryDirectory, "ownertrust.txt.age"),
+		"trust",
+		0o600,
+	)
+	age := writeExecutable(t, home, "age", `#!/bin/sh
+cat "$4"
+`)
+	gpg := writeExecutable(t, home, "gpg", `#!/bin/sh
+scratch=
+no_options=
+while test "$#" -gt 0; do
+  case "$1" in
+    --homedir)
+      shift
+      scratch=$1
+      ;;
+    --no-options)
+      no_options=yes
+      ;;
+  esac
+  shift
+done
+if test -z "$scratch" || test "$no_options" != yes; then
+  mkdir -p "$HOME/.gnupg"
+else
+  touch "$scratch/inspection-state"
+fi
+printf '%s\n' 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:'
+`)
+	planner := newTestPlanner(t, home, map[string]string{
+		"age": age,
+		"gpg": gpg,
+	})
+	target := filepath.Join(home, ".gnupg")
+	plan := planner.Plan(context.Background(), []model.RecoverySpec{{
+		ID: "gpg", Kind: model.RecoveryKindGPGKeyring,
+		Target: target, Mode: "0700", Fingerprint: fingerprint,
+		Sources: map[string]string{
+			"public":     public,
+			"private":    private,
+			"ownertrust": ownertrust,
+		},
+	}})
+	if !plan.Ready ||
+		plan.Findings[0].Status != model.RecoveryFindingMissing {
+		t.Fatalf("plan = %#v", plan)
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("read-only planning created GPG keyring: %v", err)
+	}
+}
+
 func TestPlannerReportsMissingToolWithoutInspectingTarget(t *testing.T) {
 	home := t.TempDir()
 	source := writeRecoveryFile(

@@ -230,11 +230,11 @@ func (m *Model) View() tea.View {
 					recovery.SourceUnsafe > 0 {
 					body.WriteString("\nCredential recovery plan:\n")
 					body.WriteString(fmt.Sprintf(
-						"  envctl recovery plan --config %s \\\n",
+						"  envctl recovery apply --config %s \\\n",
 						m.configRoot,
 					))
 					body.WriteString(fmt.Sprintf(
-						"    --machine %s --local --json\n",
+						"    --machine %s --local --json --dry-run\n",
 						m.result.MachineID,
 					))
 				}

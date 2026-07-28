@@ -49,6 +49,7 @@ Usage:
   envctl apply --config DIR --machine ID [--local] [--manager brew|bun|mas] --json (--dry-run | --yes)
   envctl links apply --config DIR --machine ID --local --json (--dry-run | --yes)
   envctl recovery plan --config DIR --machine ID --local --json
+  envctl recovery apply --config DIR --machine ID --local --json (--dry-run | --yes)
   envctl history --json [--state PATH] [--limit N]
   envctl tui --config DIR --inventory-dir DIR [--state PATH]
   envctl fleet refresh --config DIR --inventory-dir DIR --json
@@ -183,17 +184,48 @@ type recoveryPlanResponse struct {
 	Plan         model.RecoveryPlan `json:"plan"`
 }
 
+type recoveryApplyResponse struct {
+	Mode                   string                      `json:"mode"`
+	MachineID              string                      `json:"machine_id"`
+	ConfigDigest           string                      `json:"config_digest"`
+	Status                 model.RecoveryPlan          `json:"status"`
+	Plan                   recovery.TransactionPlan    `json:"plan"`
+	Result                 *recovery.TransactionResult `json:"result,omitempty"`
+	VerificationStatus     *model.RecoveryPlan         `json:"verification_status,omitempty"`
+	RunID                  string                      `json:"run_id,omitempty"`
+	PlanID                 string                      `json:"plan_id,omitempty"`
+	VerificationSnapshotID string                      `json:"verification_snapshot_id,omitempty"`
+}
+
 func runRecovery(
 	ctx context.Context,
 	args []string,
 	stdout, stderr io.Writer,
 ) error {
-	if len(args) == 0 || args[0] != "plan" {
+	if len(args) == 0 {
 		return errors.New(
-			"usage: envctl recovery plan --config DIR --machine ID " +
+			"usage: envctl recovery (plan | apply) --config DIR --machine ID " +
 				"--local --json",
 		)
 	}
+	switch args[0] {
+	case "plan":
+		return runRecoveryPlan(ctx, args[1:], stdout, stderr)
+	case "apply":
+		return runRecoveryApply(ctx, args[1:], stdout, stderr)
+	default:
+		return errors.New(
+			"usage: envctl recovery (plan | apply) --config DIR --machine ID " +
+				"--local --json",
+		)
+	}
+}
+
+func runRecoveryPlan(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
 	flags := flag.NewFlagSet("recovery plan", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	configRoot := flags.String("config", "", "native env-config directory")
@@ -203,7 +235,7 @@ func runRecovery(
 		"require this Mac's registered identity and inspect it locally",
 	)
 	asJSON := flags.Bool("json", false, "print the recovery plan as JSON")
-	if err := flags.Parse(args[1:]); err != nil {
+	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *configRoot == "" || *machineID == "" {
@@ -238,6 +270,359 @@ func runRecovery(
 		ConfigDigest: loaded.Digest,
 		Plan:         recoveryPlanner.Plan(ctx, loaded.Desired.Recoveries),
 	})
+}
+
+func runRecoveryApply(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("recovery apply", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineID := flags.String("machine", "", "machine id from the native config")
+	localMachine := flags.Bool(
+		"local", false,
+		"require this Mac's registered identity and execute locally",
+	)
+	backupDirectory := flags.String(
+		"backup-dir", "", "credential backup directory inside the home directory",
+	)
+	stagingDirectory := flags.String(
+		"staging-dir", "", "credential staging directory inside the home directory",
+	)
+	statePath := flags.String("state", "", "SQLite state database path")
+	dryRun := flags.Bool(
+		"dry-run",
+		false,
+		"print the transaction without changing credentials",
+	)
+	yes := flags.Bool(
+		"yes",
+		false,
+		"confirm the validated credential-recovery transaction",
+	)
+	asJSON := flags.Bool(
+		"json",
+		false,
+		"print the credential-recovery transaction as JSON",
+	)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" || *machineID == "" {
+		return errors.New("--config and --machine are required")
+	}
+	if !*localMachine {
+		return errors.New("credential recovery apply currently requires --local")
+	}
+	if !*asJSON {
+		return errors.New("credential recovery apply currently requires --json")
+	}
+	if *dryRun == *yes {
+		return errors.New("exactly one of --dry-run or --yes is required")
+	}
+	loaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	if err := forceLocalMachine(ctx, &loaded); err != nil {
+		return err
+	}
+	if len(loaded.Desired.Recoveries) == 0 {
+		return errors.New("machine has no desired recovery items")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("find home directory: %w", err)
+	}
+	resolvedBackup, err := recoveryStatePath(
+		home,
+		*backupDirectory,
+		"backups",
+	)
+	if err != nil {
+		return err
+	}
+	resolvedStaging, err := recoveryStatePath(
+		home,
+		*stagingDirectory,
+		"staging",
+	)
+	if err != nil {
+		return err
+	}
+	transaction, err := recovery.NewTransaction(
+		home,
+		resolvedBackup,
+		resolvedStaging,
+	)
+	if err != nil {
+		return err
+	}
+	plan, statusPlan, err := transaction.Plan(ctx, loaded.Desired.Recoveries)
+	if err != nil {
+		return err
+	}
+	mode := "dry-run"
+	if *yes {
+		mode = "apply"
+	}
+	response := recoveryApplyResponse{
+		Mode: mode, MachineID: loaded.Machine.ID,
+		ConfigDigest: loaded.Digest, Status: statusPlan, Plan: plan,
+	}
+	if *dryRun {
+		return encodeJSON(stdout, response)
+	}
+	if !plan.Ready {
+		return fmt.Errorf(
+			"refuse credential-recovery transaction with %d blocker(s)",
+			len(plan.Blockers),
+		)
+	}
+	reloaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return fmt.Errorf(
+			"reload configuration before credential recovery apply: %w",
+			err,
+		)
+	}
+	if err := forceLocalMachine(ctx, &reloaded); err != nil {
+		return err
+	}
+	if reloaded.Digest != loaded.Digest {
+		return errors.New(
+			"configuration changed during credential recovery planning; rerun recovery apply",
+		)
+	}
+	databasePath := *statePath
+	if databasePath == "" {
+		databasePath = loaded.Database
+	}
+	state, err := openState(databasePath)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	hostname, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("read hostname: %w", err)
+	}
+	machine := store.MachineInfo{
+		ID: loaded.Machine.ID, Hostname: hostname,
+	}
+	beforeInventory := model.Inventory{
+		CollectedAt: time.Now().UTC(),
+		Collectors:  []string{"credential-recovery"},
+		Recoveries:  statusPlan.Findings,
+	}
+	beforeSnapshot, err := state.RecordAudit(ctx, machine, beforeInventory)
+	if err != nil {
+		return err
+	}
+	record, err := state.RecordRecoveryPlan(
+		ctx,
+		loaded.Machine.ID,
+		beforeSnapshot.ID,
+		loaded.Digest,
+		"recovery apply",
+		false,
+		plan,
+	)
+	if err != nil {
+		return err
+	}
+	response.RunID = record.RunID
+	response.PlanID = record.PlanID
+	if err := state.BeginApply(ctx, record.RunID, record.PlanID); err != nil {
+		return err
+	}
+	result, applyErr := transaction.Apply(
+		ctx,
+		plan,
+		reloaded.Desired.Recoveries,
+		stateRecoveryJournal{state: state, planID: record.PlanID},
+	)
+	response.Result = &result
+	afterStatus := transactionStatusPlan(
+		ctx,
+		home,
+		reloaded.Desired.Recoveries,
+	)
+	response.VerificationStatus = &afterStatus
+	afterInventory := model.Inventory{
+		CollectedAt: time.Now().UTC(),
+		Collectors:  []string{"credential-recovery"},
+		Recoveries:  afterStatus.Findings,
+	}
+	afterSnapshot, snapshotErr := state.RecordAudit(
+		ctx,
+		machine,
+		afterInventory,
+	)
+	if snapshotErr == nil {
+		response.VerificationSnapshotID = afterSnapshot.ID
+	}
+	completionStatus := store.ActionStatusCompleted
+	if applyErr != nil || !result.Verified || snapshotErr != nil ||
+		!recoveryPlanSatisfied(afterStatus) {
+		completionStatus = store.ActionStatusFailed
+	}
+	var completionErrors []error
+	if applyErr != nil {
+		completionErrors = append(completionErrors, applyErr)
+		if err := state.SkipProposedActions(
+			ctx,
+			record.PlanID,
+			applyErr.Error(),
+		); err != nil {
+			completionErrors = append(completionErrors, err)
+		}
+	}
+	if applyErr == nil && !result.Verified {
+		completionErrors = append(
+			completionErrors,
+			errors.New("credential recovery transaction was not verified"),
+		)
+	}
+	if applyErr == nil && !recoveryPlanSatisfied(afterStatus) {
+		completionErrors = append(
+			completionErrors,
+			errors.New(
+				"credential recovery verification snapshot is not fully satisfied",
+			),
+		)
+	}
+	if snapshotErr != nil {
+		completionErrors = append(
+			completionErrors,
+			fmt.Errorf(
+				"record credential recovery verification snapshot: %w",
+				snapshotErr,
+			),
+		)
+	}
+	verificationID := ""
+	if snapshotErr == nil {
+		verificationID = afterSnapshot.ID
+	}
+	if err := state.CompleteApply(
+		ctx,
+		record.RunID,
+		record.PlanID,
+		verificationID,
+		completionStatus,
+	); err != nil {
+		completionErrors = append(completionErrors, err)
+	}
+	if err := encodeJSON(stdout, response); err != nil {
+		return err
+	}
+	return errors.Join(completionErrors...)
+}
+
+func recoveryStatePath(home, override, category string) (string, error) {
+	if override == "" {
+		return filepath.Join(
+			home,
+			".local",
+			"state",
+			"envctl",
+			category,
+			"recovery",
+		), nil
+	}
+	return expandHome(override)
+}
+
+func transactionStatusPlan(
+	ctx context.Context,
+	home string,
+	specs []model.RecoverySpec,
+) model.RecoveryPlan {
+	planner, err := recovery.NewPlanner(home)
+	if err != nil {
+		return model.RecoveryPlan{
+			Ready: false,
+			Findings: []model.RecoveryFinding{{
+				Status: model.RecoveryFindingBlocked,
+				Detail: "credential recovery verification could not inspect the home directory",
+			}},
+			Summary: model.RecoveryPlanSummary{Blocked: 1},
+		}
+	}
+	return planner.Plan(ctx, specs)
+}
+
+func recoveryPlanSatisfied(plan model.RecoveryPlan) bool {
+	return plan.Summary.Satisfied == len(plan.Findings)
+}
+
+type stateRecoveryJournal struct {
+	state  *store.Store
+	planID string
+}
+
+func (j stateRecoveryJournal) StartRecovery(
+	ctx context.Context,
+	action recovery.RecoveryAction,
+) error {
+	return j.state.StartAction(ctx, j.planID, action.Sequence)
+}
+
+func (j stateRecoveryJournal) RecordRecoveryBackup(
+	ctx context.Context,
+	action recovery.RecoveryAction,
+	originalPath, backupPath string,
+) error {
+	return j.state.RecordRecoveryBackup(
+		ctx,
+		j.planID,
+		action.Sequence,
+		originalPath,
+		backupPath,
+	)
+}
+
+func (j stateRecoveryJournal) CompleteRecovery(
+	ctx context.Context,
+	action recovery.RecoveryAction,
+) error {
+	return j.state.FinishAction(
+		ctx,
+		j.planID,
+		action.Sequence,
+		store.ActionStatusCompleted,
+		"",
+	)
+}
+
+func (j stateRecoveryJournal) FailRecovery(
+	ctx context.Context,
+	action recovery.RecoveryAction,
+	reason string,
+) error {
+	return j.state.FinishAction(
+		ctx,
+		j.planID,
+		action.Sequence,
+		store.ActionStatusFailed,
+		reason,
+	)
+}
+
+func (j stateRecoveryJournal) RollBackRecovery(
+	ctx context.Context,
+	action recovery.RecoveryAction,
+	reason string,
+) error {
+	return j.state.RollBackAction(
+		ctx,
+		j.planID,
+		action.Sequence,
+		reason,
+	)
 }
 
 type linkApplyResponse struct {

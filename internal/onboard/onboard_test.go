@@ -77,18 +77,18 @@ func TestResolveProposesNewMachineWithOnlyAvailableProfile(t *testing.T) {
 
 func TestResolveExistingIDRequiresConfirmationAndPreservesOverlay(t *testing.T) {
 	identity := Identity{
-		LocalHostname:      "ai",
+		LocalHostname:      "example-mac",
 		HardwareUUIDSHA256: strings.Repeat("c", 64),
 	}
 	machines := []envconfig.Machine{{
-		ID: "ai", Profiles: []string{"shared"}, Add: []string{"local-only"},
+		ID: "example-mac", Profiles: []string{"shared"}, Add: []string{"local-only"},
 		Access: envconfig.Access{Type: "local"},
 	}}
 	got, err := Resolve(identity, machines, []string{"shared"}, "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != StatusNeedsConfirmation || got.MachineID != "ai" {
+	if got.Status != StatusNeedsConfirmation || got.MachineID != "example-mac" {
 		t.Fatalf("result = %#v", got)
 	}
 	if got.Proposal == nil ||

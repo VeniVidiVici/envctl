@@ -18,6 +18,7 @@ import (
 
 	"github.com/VeniVidiVici/envctl/internal/model"
 	"github.com/VeniVidiVici/envctl/internal/portablelink"
+	"github.com/VeniVidiVici/envctl/internal/recovery"
 	_ "modernc.org/sqlite"
 )
 
@@ -278,6 +279,20 @@ func (s *Store) RecordAudit(
 			)
 		}
 	}
+	for _, item := range inventory.Recoveries {
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO recovery_inventory_items(
+				snapshot_id, recovery_id, kind, target_path, status, detail
+			) VALUES (?, ?, ?, ?, ?, ?)
+		`, snapshot.ID, item.RecoveryID, item.Kind, item.Target, item.Status,
+			item.Detail); err != nil {
+			return SnapshotRecord{}, fmt.Errorf(
+				"record credential recovery %s: %w",
+				item.RecoveryID,
+				err,
+			)
+		}
+	}
 	for _, collectorError := range inventory.Errors {
 		if _, err := transaction.ExecContext(ctx, `
 			INSERT INTO health_checks(
@@ -503,6 +518,142 @@ func (s *Store) RecordLinkPlan(
 		return PlanRecord{}, fmt.Errorf("commit portable-link plan record: %w", err)
 	}
 	return record, nil
+}
+
+func (s *Store) RecordRecoveryPlan(
+	ctx context.Context,
+	machineID, snapshotID, configDigest, command string,
+	interactive bool,
+	plan recovery.TransactionPlan,
+) (PlanRecord, error) {
+	if machineID == "" || snapshotID == "" {
+		return PlanRecord{}, errors.New("machine and snapshot ids are required")
+	}
+	if !plan.Ready {
+		return PlanRecord{}, errors.New(
+			"cannot record a blocked credential-recovery plan for apply",
+		)
+	}
+	now := time.Now().UTC()
+	runID, err := newID()
+	if err != nil {
+		return PlanRecord{}, err
+	}
+	planID, err := newID()
+	if err != nil {
+		return PlanRecord{}, err
+	}
+	summaryJSON, err := json.Marshal(plan)
+	if err != nil {
+		return PlanRecord{}, fmt.Errorf("encode credential-recovery plan: %w", err)
+	}
+	warningsJSON, err := json.Marshal(plan.Blockers)
+	if err != nil {
+		return PlanRecord{}, fmt.Errorf(
+			"encode credential-recovery blockers: %w",
+			err,
+		)
+	}
+	record := PlanRecord{
+		RunID: runID, PlanID: planID, MachineID: machineID, CreatedAt: now,
+	}
+	transaction, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PlanRecord{}, fmt.Errorf(
+			"begin credential-recovery plan record: %w",
+			err,
+		)
+	}
+	defer transaction.Rollback()
+	timestamp := formatTime(now)
+	interactiveValue := 0
+	if interactive {
+		interactiveValue = 1
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO runs(
+			id, machine_id, observed_snapshot_id, command, config_revision,
+			started_at, completed_at, status, interactive
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, runID, machineID, snapshotID, command, configDigest, timestamp, timestamp,
+		"planned", interactiveValue); err != nil {
+		return PlanRecord{}, fmt.Errorf(
+			"record credential-recovery run: %w",
+			err,
+		)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		INSERT INTO plans(
+			id, run_id, observed_snapshot_id, desired_digest, created_at, status,
+			summary_json, warnings_json
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, planID, runID, snapshotID, configDigest, timestamp, "ready",
+		string(summaryJSON), string(warningsJSON)); err != nil {
+		return PlanRecord{}, fmt.Errorf(
+			"record credential-recovery plan: %w",
+			err,
+		)
+	}
+	for _, action := range plan.Actions {
+		actionID, err := newID()
+		if err != nil {
+			return PlanRecord{}, err
+		}
+		if _, err := transaction.ExecContext(ctx, `
+			INSERT INTO actions(
+				id, plan_id, sequence, action_type, item_key, risk, reversible,
+				requires_privilege, status, error_summary
+			) VALUES (?, ?, ?, ?, ?, ?, 1, 0, ?, '')
+		`, actionID, planID, action.Sequence, action.Type, action.RecoveryID,
+			model.RiskMedium, ActionStatusProposed); err != nil {
+			return PlanRecord{}, fmt.Errorf(
+				"record credential-recovery action %s: %w",
+				action.RecoveryID,
+				err,
+			)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return PlanRecord{}, fmt.Errorf(
+			"commit credential-recovery plan record: %w",
+			err,
+		)
+	}
+	return record, nil
+}
+
+func (s *Store) RecordRecoveryBackup(
+	ctx context.Context,
+	planID string,
+	sequence int,
+	originalPath, backupPath string,
+) error {
+	if planID == "" || sequence <= 0 || originalPath == "" || backupPath == "" {
+		return errors.New("plan, action sequence, and backup paths are required")
+	}
+	var actionID string
+	if err := s.db.QueryRowContext(ctx, `
+		SELECT id FROM actions WHERE plan_id = ? AND sequence = ?
+	`, planID, sequence).Scan(&actionID); err != nil {
+		return fmt.Errorf(
+			"find credential-recovery action for backup: %w",
+			err,
+		)
+	}
+	backupID, err := newID()
+	if err != nil {
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx, `
+		INSERT INTO backups(
+			id, action_id, original_path, backup_path, content_digest, created_at
+		) VALUES (?, ?, ?, ?, ?, ?)
+	`, backupID, actionID, originalPath, backupPath,
+		"secret-digest-intentionally-not-recorded",
+		formatTime(time.Now())); err != nil {
+		return fmt.Errorf("record credential-recovery backup: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) RecordActionBackup(

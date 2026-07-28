@@ -62,13 +62,14 @@ symlink into a timestamped machine-local backup, creates all links as one
 transaction, verifies every resulting target, and rolls earlier operations back
 if a later operation fails. It never replaces a regular file or directory.
 
-Credential recovery is independently planned and remains read-only:
+Credential recovery has its own backup-first transaction:
 
 ```sh
-envctl recovery plan \
+envctl recovery apply \
   --config /path/to/env-config \
   --machine example-mac \
   --local \
+  --dry-run \
   --json
 ```
 
@@ -78,7 +79,18 @@ the bootstrap-installed local age identity, decrypts only into bounded in-memory
 hashes or archive readers, and reports status without emitting plaintext or
 secret digests. It detects missing tools and sources, unsafe symlinks, occupied
 targets, permission drift, content drift, missing archive members, and an
-unexpected GPG fingerprint. It does not install recovery material.
+unexpected GPG fingerprint.
+
+`--dry-run` remains read-only and does not open SQLite. Explicit `--yes`
+decrypts and validates every requested payload in a mode-0700 machine-local
+staging directory before changing any target. Existing SOPS files and differing
+archive members move to timestamped backups; the whole transaction is verified
+and rolled back if a later action fails. An absent GPG home is built and
+fingerprint-checked in staging before one atomic rename. Envctl will only repair
+the mode of an existing GPG home that already contains the expected secret key;
+it blocks an existing keyring missing that key for manual review. SQLite records
+paths, statuses, and action history, but never plaintext or secret content
+digests.
 
 For a clean Mac, `scripts/bootstrap-macos` is the versioned bootstrap
 foundation. It expects the age identity and encrypted read-only `env-config`
@@ -104,21 +116,23 @@ go run ./cmd/envctl audit --json
 go run ./cmd/envctl import-legacy --input ../env/apps-config.json
 go run ./cmd/envctl plan --legacy ../env/apps-config.json --json
 go run ./cmd/envctl apply \
-  --config ../env-config --machine ai --dry-run --json
+  --config ../env-config --machine example-mac --dry-run --json
 go run ./cmd/envctl apply \
-  --config ../env-config --machine mac-studio --dry-run --json
+  --config ../env-config --machine build-mac --dry-run --json
 go run ./cmd/envctl apply \
-  --config ../env-config --machine ai --yes --json
+  --config ../env-config --machine example-mac --yes --json
 go run ./cmd/envctl apply \
-  --config ../env-config --machine macbook-pro --yes --json
+  --config ../env-config --machine laptop --yes --json
 go run ./cmd/envctl apply \
-  --config ../env-config --machine matilda --manager bun --yes --json
+  --config ../env-config --machine remote-mac --manager bun --yes --json
 go run ./cmd/envctl apply \
-  --config ../env-config --machine matilda --manager mas --dry-run --json
+  --config ../env-config --machine remote-mac --manager mas --dry-run --json
 go run ./cmd/envctl links apply \
-  --config ../env-config --machine ai --local --dry-run --json
+  --config ../env-config --machine example-mac --local --dry-run --json
 go run ./cmd/envctl recovery plan \
-  --config ../env-config --machine ai --local --json
+  --config ../env-config --machine example-mac --local --json
+go run ./cmd/envctl recovery apply \
+  --config ../env-config --machine example-mac --local --dry-run --json
 go run ./cmd/envctl config resolve \
   --config ./examples/env-config --machine example-mac --json
 go run ./cmd/envctl history --json
