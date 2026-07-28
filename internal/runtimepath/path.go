@@ -20,6 +20,7 @@ func Build(home, inherited string) string {
 		filepath.Join(home, ".local", "bin"),
 		filepath.Join(home, ".opencode", "bin"),
 		filepath.Join(home, ".bun", "bin"),
+		filepath.Join(home, ".local", "share", "mise", "shims"),
 		"/opt/homebrew/bin",
 		"/opt/homebrew/sbin",
 		"/usr/local/bin",

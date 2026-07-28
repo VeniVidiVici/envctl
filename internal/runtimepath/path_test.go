@@ -17,8 +17,9 @@ func TestBuildPrependsSafeMacAndUserPathsWithoutDuplicates(t *testing.T) {
 	}
 	if parts[0] != "/Users/example/.local/bin" ||
 		parts[1] != "/Users/example/.opencode/bin" ||
-		parts[2] != "/Users/example/.bun/bin" {
-		t.Fatalf("leading paths = %#v", parts[:3])
+		parts[2] != "/Users/example/.bun/bin" ||
+		parts[3] != "/Users/example/.local/share/mise/shims" {
+		t.Fatalf("leading paths = %#v", parts[:4])
 	}
 	if strings.Count(got, "/opt/homebrew/bin") != 1 {
 		t.Fatalf("Homebrew path duplicated: %q", got)

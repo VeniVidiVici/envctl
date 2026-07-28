@@ -421,7 +421,11 @@ func (t *Transaction) stage(
 			return stagedRecovery{}, err
 		}
 	case model.RecoveryKindGPGKeyring:
-		shortPath, err := os.MkdirTemp(t.home, ".envctl-gpg-stage-*")
+		// GnuPG places agent sockets below the homedir. macOS TMPDIR and a
+		// disposable HOME can both be long enough to exceed the Unix socket
+		// path limit, so use the stable short /tmp spelling for this isolated
+		// staging keyring.
+		shortPath, err := os.MkdirTemp("/tmp", "envctl-gpg-stage-*")
 		if err != nil {
 			return stagedRecovery{}, err
 		}
