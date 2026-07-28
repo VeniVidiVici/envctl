@@ -15,6 +15,22 @@ Its first apply slice is intentionally narrow: it can install missing Homebrew
 formulae and casks plus declared Bun global tools on config-declared local and
 SSH machines.
 
+Build the committed checkout into the user-local PATH:
+
+```sh
+mkdir -p ~/.local/bin
+go build -trimpath -o ~/.local/bin/envctl ./cmd/envctl
+chmod 0755 ~/.local/bin/envctl
+```
+
+Then launch the fleet review TUI with:
+
+```sh
+envctl tui \
+  --config ~/Documents/env-config \
+  --inventory-dir ~/.local/state/envctl/migration-20260728
+```
+
 ## Current commands
 
 ```sh
