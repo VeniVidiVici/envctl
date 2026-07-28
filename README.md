@@ -61,6 +61,11 @@ transaction in a child process, so it replans against live state, asks for
 confirmation, journals mutations, and verifies the result. `--json` prints the
 same phase plan without changing state.
 
+For clean-account child processes, envctl defaults `XDG_CONFIG_HOME` to
+`~/.config` when it is otherwise unset. An explicit caller value is preserved.
+This makes portable XDG configuration, including Homebrew's trust policy,
+available before the user's first new login shell.
+
 Portable links also have a separately scoped transaction:
 
 ```sh
