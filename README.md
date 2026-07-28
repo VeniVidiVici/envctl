@@ -23,6 +23,19 @@ go build -trimpath -o ~/.local/bin/envctl ./cmd/envctl
 chmod 0755 ~/.local/bin/envctl
 ```
 
+Validate a native configuration without collecting or changing machine state:
+
+```sh
+envctl config validate --config /path/to/env-config --json
+```
+
+For a clean Mac, `scripts/bootstrap-macos` is the versioned bootstrap
+foundation. It expects the age identity and encrypted read-only `env-config`
+deploy key in iCloud's `Env Secrets` directory. It installs only the tools
+needed to clone both repositories and build envctl, verifies the encrypted
+config, and records an initial read-only audit. Desired-state onboarding and
+link application are intentionally not part of this script yet.
+
 Then launch the fleet review TUI with:
 
 ```sh

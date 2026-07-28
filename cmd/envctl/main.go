@@ -38,6 +38,7 @@ const usage = `envctl is a read-first macOS environment manager.
 Usage:
   envctl audit --json [--state PATH] [--no-record]
   envctl import-legacy --input PATH
+  envctl config validate --config DIR --json
   envctl config resolve --config DIR --machine ID --json
   envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
   envctl apply --config DIR --machine ID [--manager brew|bun|mas] --json (--dry-run | --yes)
@@ -799,9 +800,23 @@ func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error
 	return encoder.Encode(plan)
 }
 
+type configValidationResponse struct {
+	Valid    bool     `json:"valid"`
+	Machines []string `json:"machines"`
+}
+
 func runConfig(args []string, stdout, stderr io.Writer) error {
-	if len(args) == 0 || args[0] != "resolve" {
-		return errors.New("usage: envctl config resolve --config DIR --machine ID --json")
+	if len(args) == 0 {
+		return errors.New(
+			"usage: envctl config (validate --config DIR --json | " +
+				"resolve --config DIR --machine ID --json)",
+		)
+	}
+	if args[0] == "validate" {
+		return runConfigValidate(args[1:], stdout, stderr)
+	}
+	if args[0] != "resolve" {
+		return fmt.Errorf("unknown config command %q", args[0])
 	}
 	flags := flag.NewFlagSet("config resolve", flag.ContinueOnError)
 	flags.SetOutput(stderr)
@@ -824,6 +839,39 @@ func runConfig(args []string, stdout, stderr io.Writer) error {
 	encoder := json.NewEncoder(stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(loaded)
+}
+
+func runConfigValidate(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("config validate", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	asJSON := flags.Bool("json", false, "print the validation result as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" {
+		return errors.New("--config is required")
+	}
+	if !*asJSON {
+		return errors.New("config validate currently requires --json")
+	}
+	machineIDs, err := envconfig.MachineIDs(*configRoot)
+	if err != nil {
+		return err
+	}
+	if len(machineIDs) == 0 {
+		return errors.New("native configuration contains no machines")
+	}
+	for _, machineID := range machineIDs {
+		if _, err := envconfig.Load(*configRoot, machineID); err != nil {
+			return fmt.Errorf("validate machine %q: %w", machineID, err)
+		}
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(configValidationResponse{
+		Valid: true, Machines: machineIDs,
+	})
 }
 
 func runHistory(ctx context.Context, args []string, stdout, stderr io.Writer) error {
