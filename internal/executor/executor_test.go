@@ -96,6 +96,92 @@ func TestPlanBuildsExactMiseRuntimeCommand(t *testing.T) {
 	}
 }
 
+func TestPlanBuildsExactFixedCustomToolCommands(t *testing.T) {
+	tests := []struct {
+		packageID string
+		name      string
+		args      []string
+	}{
+		{
+			packageID: "claude",
+			name:      "/bin/bash",
+			args: []string{
+				"-c",
+				"curl -fsSL https://claude.ai/install.sh | /bin/bash",
+			},
+		},
+		{
+			packageID: "gh-dash",
+			name:      "gh",
+			args:      []string{"extension", "install", "dlvhdr/gh-dash"},
+		},
+		{
+			packageID: "opencode",
+			name:      "/bin/bash",
+			args: []string{
+				"-c",
+				"curl -fsSL https://opencode.ai/install | /bin/bash",
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.packageID, func(t *testing.T) {
+			action := model.Action{
+				Sequence: 1, Type: model.ActionInstall,
+				PackageID: test.packageID, Manager: model.ManagerCustom,
+				Kind: model.KindTool, Package: test.packageID,
+				Risk: model.RiskLow, Reversible: true,
+			}
+			commands, err := New(nil, nil).Plan([]model.Action{action})
+			if err != nil {
+				t.Fatalf("Plan() error = %v", err)
+			}
+			if len(commands) != 1 ||
+				commands[0].Name != test.name ||
+				!reflect.DeepEqual(commands[0].Args, test.args) {
+				t.Fatalf(
+					"commands = %#v, want %s %#v",
+					commands, test.name, test.args,
+				)
+			}
+		})
+	}
+}
+
+func TestPlanRejectsUnregisteredOrUnsafeCustomTools(t *testing.T) {
+	base := model.Action{
+		Sequence: 1, Type: model.ActionInstall, PackageID: "claude",
+		Manager: model.ManagerCustom, Kind: model.KindTool,
+		Package: "claude", Risk: model.RiskLow,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*model.Action)
+	}{
+		{"unknown tool", func(action *model.Action) {
+			action.Package = "unknown"
+		}},
+		{"wrong kind", func(action *model.Action) {
+			action.Kind = model.KindFormula
+		}},
+		{"source", func(action *model.Action) {
+			action.Source = "remote-config"
+		}},
+		{"version", func(action *model.Action) {
+			action.Version = "1.2.3"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			action := base
+			test.mutate(&action)
+			if _, err := New(nil, nil).Plan([]model.Action{action}); err == nil {
+				t.Fatal("Plan() error = nil, want rejection")
+			}
+		})
+	}
+}
+
 func TestPlanRejectsUnsafeMiseActions(t *testing.T) {
 	base := model.Action{
 		Sequence: 1, Type: model.ActionInstall, PackageID: "node-runtime",

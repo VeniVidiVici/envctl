@@ -54,11 +54,12 @@ envctl setup \
   --local
 ```
 
-Setup presents credential recovery, portable links, Homebrew, Mise, Bun, Mac
-App Store review, and manual tools as ordered phases. Each executable phase
-launches the existing scoped envctl transaction in a child process, so it
-replans against live state, asks for confirmation, journals mutations, and
-verifies the result. `--json` prints the same phase plan without changing state.
+Setup presents credential recovery, portable links, Homebrew, Mise, Bun,
+fixed-registry custom tools, Mac App Store review, and explicitly manual tools
+as ordered phases. Each executable phase launches the existing scoped envctl
+transaction in a child process, so it replans against live state, asks for
+confirmation, journals mutations, and verifies the result. `--json` prints the
+same phase plan without changing state.
 
 Portable links also have a separately scoped transaction:
 
@@ -201,19 +202,23 @@ Use `--inventory PATH` to plan centrally from a saved remote audit.
 
 `apply` always creates a new live inventory. `--dry-run` supports both local and
 SSH machines, validates and prints the exact argv for supported low-risk
-Homebrew, Mise, and Bun installs, and reports every unsupported action as a
-blocker. Remote dry-runs use the same agentless temporary-binary transport as
-fleet refresh and do not open the state database. `--yes` explicitly authorizes
-execution on a config-declared local or SSH machine and refuses the entire plan
-if any selected action falls outside the supported subset.
+Homebrew, Mise, Bun, and fixed-registry custom-tool installs, and reports every
+unsupported action as a blocker. Remote dry-runs use the same agentless
+temporary-binary transport as fleet refresh and do not open the state database.
+`--yes` explicitly authorizes execution on a config-declared local or SSH
+machine and refuses the entire plan if any selected action falls outside the
+supported subset.
 
-`--manager brew`, `--manager mise`, `--manager bun`, or `--manager mas`
-explicitly limits an apply transaction.
+`--manager brew`, `--manager mise`, `--manager bun`, `--manager custom`, or
+`--manager mas` explicitly limits an apply transaction.
 Actions for other managers remain visible as deferred actions and are not
 written into that run's executable plan. Bun execution accepts only
 `bun add --global --ignore-scripts --no-progress --no-summary PACKAGE`.
 Mise execution accepts only `mise install --yes TOOL@VERSION` for a declared
-tool and validated version request.
+tool and validated version request. Custom-tool execution accepts only three
+compiled-in identities: the official native Claude Code installer, the
+`dlvhdr/gh-dash` GitHub CLI extension, and the official native OpenCode
+installer. No installer command or URL is loaded from configuration.
 
 MAS is preflight-only. `--manager mas --dry-run` performs read-only storefront
 lookups on the target and reports mas version, storefront, macOS compatibility,
@@ -228,8 +233,8 @@ applied package has reached its declared type, source, and configured Mise
 version request. Remote commands use strict, noninteractive, independent SSH
 connections and accept only the exact validated package-manager argv.
 Homebrew upgrades, removals, source repair, Mac App Store installation, Bun
-updates/removals, custom tools, and privileged actions are not supported by
-this slice.
+updates/removals, unregistered custom tools, and privileged actions are not
+supported by this slice.
 
 Audits and plans are recorded in `~/.local/state/envctl/state.db` by default.
 Use `--no-record` for an entirely ephemeral run or `--state PATH` to select a

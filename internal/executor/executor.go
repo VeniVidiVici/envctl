@@ -183,9 +183,54 @@ func commandFor(action model.Action) (Command, error) {
 		return bunCommand(action)
 	case model.ManagerMise:
 		return miseCommand(action)
+	case model.ManagerCustom:
+		return customCommand(action)
 	default:
 		return Command{}, fmt.Errorf("unsupported manager %q", action.Manager)
 	}
+}
+
+func customCommand(action model.Action) (Command, error) {
+	if action.Kind != model.KindTool {
+		return Command{}, fmt.Errorf("unsupported custom-tool kind %q", action.Kind)
+	}
+	if action.Source != "" {
+		return Command{}, fmt.Errorf("unsupported custom-tool source %q", action.Source)
+	}
+	if action.Version != "" {
+		return Command{}, fmt.Errorf(
+			"custom-tool version pinning is unsupported for %q", action.Package,
+		)
+	}
+
+	command := Command{
+		Sequence:  action.Sequence,
+		PackageID: action.PackageID,
+	}
+	switch action.Package {
+	case "claude":
+		command.Name = "/bin/bash"
+		command.Args = []string{
+			"-c",
+			"curl -fsSL https://claude.ai/install.sh | /bin/bash",
+		}
+	case "gh-dash":
+		command.Name = "gh"
+		command.Args = []string{
+			"extension", "install", "dlvhdr/gh-dash",
+		}
+	case "opencode":
+		command.Name = "/bin/bash"
+		command.Args = []string{
+			"-c",
+			"curl -fsSL https://opencode.ai/install | /bin/bash",
+		}
+	default:
+		return Command{}, fmt.Errorf(
+			"unsupported custom-tool identity %q", action.Package,
+		)
+	}
+	return command, nil
 }
 
 func miseCommand(action model.Action) (Command, error) {

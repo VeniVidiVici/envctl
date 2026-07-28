@@ -21,6 +21,7 @@ const (
 	PhaseHomebrew PhaseID = "homebrew"
 	PhaseMise     PhaseID = "mise"
 	PhaseBun      PhaseID = "bun"
+	PhaseCustom   PhaseID = "custom"
 	PhaseMAS      PhaseID = "mas"
 	PhaseManual   PhaseID = "manual"
 )

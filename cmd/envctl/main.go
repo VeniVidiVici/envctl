@@ -49,7 +49,7 @@ Usage:
   envctl config validate --config DIR --json
   envctl config resolve --config DIR --machine ID --json
   envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
-  envctl apply --config DIR --machine ID [--local] [--manager brew|mise|bun|mas] --json (--dry-run | --yes)
+  envctl apply --config DIR --machine ID [--local] [--manager brew|mise|bun|custom|mas] --json (--dry-run | --yes)
   envctl links apply --config DIR --machine ID --local --json (--dry-run | --yes)
   envctl recovery plan --config DIR --machine ID --local --json
   envctl recovery apply --config DIR --machine ID --local --json (--dry-run | --yes)
@@ -237,6 +237,17 @@ func buildSetupPhases(
 			loaded,
 			inventory,
 			packagePlan,
+			model.ManagerCustom,
+			setupui.PhaseCustom,
+			"Custom tools",
+			"Install missing tools through envctl's fixed, reviewed installer registry.",
+			[]setupui.PhaseID{setupui.PhaseHomebrew},
+			true,
+		),
+		buildManagerSetupPhase(
+			loaded,
+			inventory,
+			packagePlan,
 			model.ManagerMAS,
 			setupui.PhaseMAS,
 			"Mac App Store review",
@@ -404,8 +415,7 @@ func buildManualSetupPhase(
 		if finding.Desired == nil {
 			continue
 		}
-		switch finding.Desired.Manager {
-		case model.ManagerBrew, model.ManagerBun, model.ManagerMAS:
+		if finding.Desired.Manager != model.ManagerManual {
 			continue
 		}
 		if finding.Status != model.FindingSatisfied {
@@ -1287,7 +1297,7 @@ func runApply(
 	configRoot := flags.String("config", "", "native env-config directory")
 	machineID := flags.String("machine", "", "machine id from the native config")
 	managerName := flags.String(
-		"manager", "", "limit apply to one supported manager: brew, mise, bun, or mas",
+		"manager", "", "limit apply to one supported manager: brew, mise, bun, custom, or mas",
 	)
 	localMachine := flags.Bool(
 		"local", false,
@@ -1548,11 +1558,11 @@ func parseApplyManager(value string) (model.Manager, error) {
 	case "":
 		return "", nil
 	case model.ManagerBrew, model.ManagerMise,
-		model.ManagerBun, model.ManagerMAS:
+		model.ManagerBun, model.ManagerCustom, model.ManagerMAS:
 		return model.Manager(value), nil
 	default:
 		return "", fmt.Errorf(
-			"unsupported --manager %q; expected brew, mise, bun, or mas", value,
+			"unsupported --manager %q; expected brew, mise, bun, custom, or mas", value,
 		)
 	}
 }
@@ -1566,6 +1576,9 @@ func collectorForApply(manager model.Manager) string {
 	}
 	if manager == model.ManagerMAS {
 		return "mas"
+	}
+	if manager == model.ManagerCustom {
+		return "custom"
 	}
 	return "homebrew"
 }

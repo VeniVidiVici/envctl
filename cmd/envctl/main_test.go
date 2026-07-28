@@ -135,17 +135,23 @@ access:
 	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Phases) != 7 {
+	if len(response.Phases) != 8 {
 		t.Fatalf("phases = %#v", response.Phases)
 	}
-	var links setupui.Phase
+	var links, manual setupui.Phase
 	for _, phase := range response.Phases {
 		if phase.ID == setupui.PhaseLinks {
 			links = phase
 		}
+		if phase.ID == setupui.PhaseManual {
+			manual = phase
+		}
 	}
 	if links.Status != setupui.StatusReady || links.Actions != 1 {
 		t.Fatalf("link phase = %#v", links)
+	}
+	if manual.Status != setupui.StatusBlocked || manual.Actions != 1 {
+		t.Fatalf("manual phase = %#v", manual)
 	}
 	if _, err := os.Lstat(statePath); !os.IsNotExist(err) {
 		t.Fatalf("setup JSON created state: %v", err)
@@ -750,15 +756,37 @@ func TestSelectActionsScopesOneManagerAndDefersOthers(t *testing.T) {
 }
 
 func TestParseApplyManagerAllowsOnlyImplementedManagers(t *testing.T) {
-	for _, value := range []string{"", "brew", "bun", "mas"} {
+	for _, value := range []string{"", "brew", "bun", "custom", "mas"} {
 		if _, err := parseApplyManager(value); err != nil {
 			t.Fatalf("parseApplyManager(%q) error = %v", value, err)
 		}
 	}
-	for _, value := range []string{"custom", "all"} {
+	for _, value := range []string{"manual", "all"} {
 		if _, err := parseApplyManager(value); err == nil {
 			t.Fatalf("parseApplyManager(%q) error = nil", value)
 		}
+	}
+}
+
+func TestManualSetupPhaseOnlyCountsExplicitManualItems(t *testing.T) {
+	plan := model.Plan{Findings: []model.Finding{
+		{
+			Status: model.FindingMissing,
+			Desired: &model.PackageSpec{
+				ID: "runtime", Manager: model.ManagerMise,
+			},
+		},
+		{
+			Status: model.FindingMissing,
+			Desired: &model.PackageSpec{
+				ID: "external", Manager: model.ManagerManual,
+			},
+		},
+	}}
+	phase := buildManualSetupPhase(plan)
+	if phase.Actions != 1 || phase.Blockers != 1 ||
+		phase.Status != setupui.StatusBlocked {
+		t.Fatalf("phase = %#v", phase)
 	}
 }
 

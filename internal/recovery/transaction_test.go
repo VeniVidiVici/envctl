@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -309,7 +310,8 @@ func TestTransactionAtomicallyRestoresAbsentGPGKeyring(t *testing.T) {
 for argument do source=$argument; done
 cat "$source"
 `)
-	gpg := writeExecutable(t, home, "gpg", `#!/bin/sh
+	stageRecord := filepath.Join(home, "gpg-stage-path")
+	gpg := writeExecutable(t, home, "gpg", fmt.Sprintf(`#!/bin/sh
 home=
 operation=
 last=
@@ -339,13 +341,14 @@ while test "$#" -gt 0; do
 done
 case "$operation" in
   show)
-    printf '%s\n' 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:'
+    printf '%%s\n' 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:'
     ;;
   list)
     test -f "$home/private-imported" || exit 2
-    printf '%s\n' 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:'
+    printf '%%s\n' 'fpr:::::::::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:'
     ;;
   import)
+    printf '%%s\n' "$home" >%q
     mkdir -p "$home"
     if test -f "$last"; then
       touch "$home/public-imported"
@@ -359,7 +362,7 @@ case "$operation" in
     touch "$home/ownertrust-imported"
     ;;
 esac
-`)
+`, stageRecord))
 	gpgconf := writeExecutable(t, home, "gpgconf", "#!/bin/sh\nexit 0\n")
 	target := filepath.Join(home, ".gnupg")
 	specs := []model.RecoverySpec{{
@@ -388,6 +391,14 @@ esac
 	}
 	if !result.Verified || result.RolledBack {
 		t.Fatalf("result = %#v", result)
+	}
+	rawStagePath, err := os.ReadFile(stageRecord)
+	if err != nil ||
+		!strings.HasPrefix(
+			strings.TrimSpace(string(rawStagePath)),
+			"/tmp/envctl-gpg-stage-",
+		) {
+		t.Fatalf("GPG staging path = %q, %v", rawStagePath, err)
 	}
 	for _, marker := range []string{
 		"public-imported",
