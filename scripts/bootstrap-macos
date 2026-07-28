@@ -201,6 +201,16 @@ verify_foundation() {
 		>"$BOOTSTRAP_STATE/initial-audit.json"
 }
 
+launch_onboarding() {
+	if [[ -t 0 && -t 1 ]]; then
+		log "Launching envctl onboarding"
+		"$ENVCTL_BINARY" onboard --config "$ENV_CONFIG_CHECKOUT"
+		return
+	fi
+	printf '\nRun onboarding from an interactive terminal:\n'
+	printf '  %q onboard --config %q\n' "$ENVCTL_BINARY" "$ENV_CONFIG_CHECKOUT"
+}
+
 main() {
 	require_regular_file "$RECOVERY_AGE_IDENTITY"
 	require_regular_file "$RECOVERY_DEPLOY_KEY"
@@ -219,13 +229,14 @@ main() {
 		"$deploy_ssh"
 	build_envctl
 	verify_foundation
+	launch_onboarding
 
 	printf '\nBootstrap foundation complete.\n'
 	printf 'envctl:    %s\n' "$ENVCTL_BINARY"
 	printf 'code:      %s\n' "$ENVCTL_CHECKOUT"
 	printf 'config:    %s\n' "$ENV_CONFIG_CHECKOUT"
 	printf 'inventory: %s\n' "$BOOTSTRAP_STATE/initial-audit.json"
-	printf '\nPackage/config onboarding is not enabled yet; no desired state was applied.\n'
+	printf '\nNo desired package or link state was applied automatically.\n'
 }
 
 main "$@"

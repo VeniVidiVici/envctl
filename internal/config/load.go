@@ -53,6 +53,18 @@ type Loaded struct {
 }
 
 func MachineIDs(root string) ([]string, error) {
+	machines, err := Machines(root)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(machines))
+	for _, machine := range machines {
+		ids = append(ids, machine.ID)
+	}
+	return ids, nil
+}
+
+func Machines(root string) ([]Machine, error) {
 	absoluteRoot, err := filepath.Abs(root)
 	if err != nil {
 		return nil, fmt.Errorf("resolve config root: %w", err)
@@ -77,7 +89,7 @@ func MachineIDs(root string) ([]string, error) {
 		return nil, err
 	}
 	seen := make(map[string]bool)
-	ids := make([]string, 0, len(files))
+	machines := make([]Machine, 0, len(files))
 	for _, relative := range files {
 		path, err := safePath(absoluteRoot, relative)
 		if err != nil {
@@ -100,11 +112,70 @@ func MachineIDs(root string) ([]string, error) {
 		if seen[machineFile.ID] {
 			return nil, fmt.Errorf("duplicate machine %q", machineFile.ID)
 		}
+		if err := validateMachine(machineFile.Machine); err != nil {
+			return nil, fmt.Errorf("validate %s: %w", relative, err)
+		}
 		seen[machineFile.ID] = true
-		ids = append(ids, machineFile.ID)
+		machines = append(machines, machineFile.Machine)
 	}
-	sort.Strings(ids)
-	return ids, nil
+	sort.Slice(machines, func(i, j int) bool {
+		return machines[i].ID < machines[j].ID
+	})
+	return machines, nil
+}
+
+func ProfileNames(root string) ([]string, error) {
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolve config root: %w", err)
+	}
+	var rootConfig rootFile
+	raw, err := os.ReadFile(filepath.Join(absoluteRoot, "envctl.yaml"))
+	if err != nil {
+		return nil, fmt.Errorf("read envctl.yaml: %w", err)
+	}
+	if err := decodeStrict(raw, &rootConfig); err != nil {
+		return nil, fmt.Errorf("decode envctl.yaml: %w", err)
+	}
+	if rootConfig.Version != 1 {
+		return nil, fmt.Errorf("envctl.yaml version is %d; expected 1", rootConfig.Version)
+	}
+	if rootConfig.Profiles == "" {
+		return nil, errors.New("envctl.yaml must define profiles")
+	}
+	files, err := yamlFiles(absoluteRoot, rootConfig.Profiles)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	names := make([]string, 0, len(files))
+	for _, relative := range files {
+		path, err := safePath(absoluteRoot, relative)
+		if err != nil {
+			return nil, err
+		}
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", relative, err)
+		}
+		var profileFile versionedProfile
+		if err := decodeStrict(raw, &profileFile); err != nil {
+			return nil, fmt.Errorf("decode %s: %w", relative, err)
+		}
+		if profileFile.Version != 1 {
+			return nil, fmt.Errorf("%s version is %d; expected 1", relative, profileFile.Version)
+		}
+		if profileFile.Name == "" {
+			return nil, fmt.Errorf("%s has no profile name", relative)
+		}
+		if seen[profileFile.Name] {
+			return nil, fmt.Errorf("duplicate profile %q", profileFile.Name)
+		}
+		seen[profileFile.Name] = true
+		names = append(names, profileFile.Name)
+	}
+	sort.Strings(names)
+	return names, nil
 }
 
 func Load(root, machineID string) (Loaded, error) {
@@ -384,6 +455,21 @@ func validateMachine(machine Machine) error {
 	if !safeIdentifier(machine.ID) {
 		return fmt.Errorf("machine has unsafe id %q", machine.ID)
 	}
+	if fingerprint := machine.Match.HardwareUUIDSHA256; fingerprint != "" {
+		if len(fingerprint) != sha256.Size*2 {
+			return fmt.Errorf(
+				"machine %q has invalid hardware UUID fingerprint length",
+				machine.ID,
+			)
+		}
+		if _, err := hex.DecodeString(fingerprint); err != nil ||
+			fingerprint != strings.ToLower(fingerprint) {
+			return fmt.Errorf(
+				"machine %q has invalid hardware UUID fingerprint",
+				machine.ID,
+			)
+		}
+	}
 	switch machine.Access.Type {
 	case "local":
 		if machine.Access.Host != "" {
@@ -408,6 +494,10 @@ func validateMachine(machine Machine) error {
 			machine.ID, machine.Access.Type)
 	}
 	return nil
+}
+
+func ValidateMachine(machine Machine) error {
+	return validateMachine(machine)
 }
 
 func safeIdentifier(value string) bool {
