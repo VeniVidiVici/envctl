@@ -12,6 +12,14 @@ func Apply() error {
 	if err != nil {
 		return fmt.Errorf("find home directory for executable path: %w", err)
 	}
+	if os.Getenv("XDG_CONFIG_HOME") == "" {
+		if err := os.Setenv(
+			"XDG_CONFIG_HOME",
+			filepath.Join(home, ".config"),
+		); err != nil {
+			return fmt.Errorf("set default XDG config directory: %w", err)
+		}
+	}
 	return os.Setenv("PATH", Build(home, os.Getenv("PATH")))
 }
 

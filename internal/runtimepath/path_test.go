@@ -1,10 +1,45 @@
 package runtimepath
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestApplyProvidesCleanAccountXDGDefault(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	if err := Apply(); err != nil {
+		t.Fatal(err)
+	}
+	if got := os.Getenv("XDG_CONFIG_HOME"); got != filepath.Join(home, ".config") {
+		t.Fatalf("XDG_CONFIG_HOME = %q", got)
+	}
+	if !strings.HasPrefix(
+		os.Getenv("PATH"),
+		filepath.Join(home, ".local", "bin")+string(os.PathListSeparator),
+	) {
+		t.Fatalf("PATH = %q", os.Getenv("PATH"))
+	}
+}
+
+func TestApplyPreservesExplicitXDGConfigHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", "/custom/config")
+	t.Setenv("PATH", "/usr/bin:/bin")
+
+	if err := Apply(); err != nil {
+		t.Fatal(err)
+	}
+	if got := os.Getenv("XDG_CONFIG_HOME"); got != "/custom/config" {
+		t.Fatalf("XDG_CONFIG_HOME = %q", got)
+	}
+}
 
 func TestBuildPrependsSafeMacAndUserPathsWithoutDuplicates(t *testing.T) {
 	got := Build(
