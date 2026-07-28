@@ -264,6 +264,128 @@ access:
 	}
 }
 
+func TestLoadResolvesRecoverySourcesAndTargets(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "env-config")
+	writeConfigFile(t, root, "secrets/example.sops.env", "encrypted")
+	writeConfigFile(t, root, "envctl.yaml", `
+version: 1
+catalog: catalog.yaml
+profiles: profiles
+machines: machines
+recovery_root: ~/Library/Recovery
+`)
+	writeConfigFile(t, root, "catalog.yaml", `
+version: 1
+packages:
+  example:
+    manager: brew
+    kind: formula
+    source: homebrew/core
+    package: example
+    update_policy: managed
+recoveries:
+  example-secret:
+    kind: sops-file
+    source: secrets/example.sops.env
+    target: ~/.config/example/env
+    format: dotenv
+    mode: "0600"
+  ssh-private:
+    kind: age-archive
+    source: ssh-private.tar.age
+    target: ~/.ssh
+    mode: "0600"
+    members:
+      - id_example
+`)
+	writeConfigFile(t, root, "profiles/base.yaml", `
+version: 1
+name: base
+packages: [example]
+recoveries: [example-secret, ssh-private]
+`)
+	writeConfigFile(t, root, "machines/example.yaml", `
+version: 1
+id: example
+profiles: [base]
+access:
+  type: local
+`)
+
+	got, err := Load(root, "example")
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(got.Desired.Recoveries) != 2 {
+		t.Fatalf("recoveries = %#v", got.Desired.Recoveries)
+	}
+	if got.Desired.Recoveries[0].Source !=
+		filepath.Join(root, "secrets", "example.sops.env") ||
+		got.Desired.Recoveries[0].Target !=
+			filepath.Join(home, ".config", "example", "env") {
+		t.Fatalf("sops recovery = %#v", got.Desired.Recoveries[0])
+	}
+	if got.Desired.Recoveries[1].Source !=
+		filepath.Join(home, "Library", "Recovery", "ssh-private.tar.age") ||
+		got.Desired.Recoveries[1].Target != filepath.Join(home, ".ssh") {
+		t.Fatalf("archive recovery = %#v", got.Desired.Recoveries[1])
+	}
+	if !containsString(got.LoadedFiles, "secrets/example.sops.env") {
+		t.Fatalf("loaded files = %v", got.LoadedFiles)
+	}
+}
+
+func TestLoadRejectsUnsafeRecoveryArchiveMember(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "env-config")
+	writeConfigFile(t, root, "envctl.yaml", `
+version: 1
+catalog: catalog.yaml
+profiles: profiles
+machines: machines
+recovery_root: ~/Library/Recovery
+`)
+	writeConfigFile(t, root, "catalog.yaml", `
+version: 1
+packages:
+  example:
+    manager: brew
+    kind: formula
+    source: homebrew/core
+    package: example
+    update_policy: managed
+recoveries:
+  ssh-private:
+    kind: age-archive
+    source: ssh-private.tar.age
+    target: ~/.ssh
+    mode: "0600"
+    members:
+      - ../escape
+`)
+	writeConfigFile(t, root, "profiles/base.yaml", `
+version: 1
+name: base
+packages: [example]
+recoveries: [ssh-private]
+`)
+	writeConfigFile(t, root, "machines/example.yaml", `
+version: 1
+id: example
+profiles: [base]
+access:
+  type: local
+`)
+
+	_, err := Load(root, "example")
+	if err == nil || !strings.Contains(err.Error(), "unsafe or duplicate member") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
 func containsString(values []string, wanted string) bool {
 	for _, value := range values {
 		if value == wanted {
