@@ -12,6 +12,22 @@ type fakeRunner struct {
 	err    error
 }
 
+type fallbackRunner struct {
+	json  []byte
+	plain []byte
+}
+
+func (r fallbackRunner) Output(
+	_ context.Context,
+	_ string,
+	args ...string,
+) ([]byte, error) {
+	if len(args) == 2 && args[0] == "list" && args[1] == "--json" {
+		return r.json, nil
+	}
+	return r.plain, nil
+}
+
 func (r fakeRunner) Output(context.Context, string, ...string) ([]byte, error) {
 	return r.output, r.err
 }
@@ -43,15 +59,36 @@ func TestRejectsInvalidRecord(t *testing.T) {
 	}
 }
 
-func TestIgnoresRecordsWithoutStoreIdentity(t *testing.T) {
-	input := []byte(
-		"{\"adamID\":0,\"displayName\":\"Unidentified App\",\"path\":\"/Applications/Unidentified.app\",\"version\":\"1.0\"}\n",
-	)
-	got, err := NewCollector(fakeRunner{output: input}).Collect(context.Background())
-	if err != nil {
-		t.Fatalf("Collect() error = %v", err)
+func TestPlaceholderRecordsFallBackToPlainInventory(t *testing.T) {
+	runner := fallbackRunner{
+		json: []byte(
+			"{\"name\":\"\"}\n" +
+				"{\"adamID\":1511935951,\"displayName\":\"BetterJSON\",\"path\":\"/Applications/BetterJSON.app\",\"version\":\"2.3\"}\n",
+		),
+		plain: []byte(
+			"1511935951  BetterJSON       (2.3)\n" +
+				"1518036000  Sequel Ace       (5.3.0)\n" +
+				" 803453959  Slack            (4.51.180)\n",
+		),
 	}
-	if len(got) != 0 {
-		t.Fatalf("Collect() returned %#v, want empty", got)
+	got, err := NewCollector(runner).Collect(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 ||
+		got[0].Package != "1511935951" ||
+		got[0].Application != "/Applications/BetterJSON.app" ||
+		got[1].Package != "1518036000" ||
+		got[2].Package != "803453959" {
+		t.Fatalf("packages = %#v", got)
+	}
+}
+
+func TestPlaceholderFallbackMustProduceIdentities(t *testing.T) {
+	_, err := NewCollector(fallbackRunner{
+		json: []byte("{\"name\":\"\"}\n"),
+	}).Collect(context.Background())
+	if err == nil {
+		t.Fatal("Collect() error = nil, want incomplete-inventory failure")
 	}
 }
