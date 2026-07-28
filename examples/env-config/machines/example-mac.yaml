@@ -1,0 +1,8 @@
+version: 1
+id: example-mac
+
+profiles:
+  - development
+
+access:
+  type: local

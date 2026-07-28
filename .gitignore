@@ -1,0 +1,9 @@
+/envctl
+/dist/
+/.idea/
+/.vscode/
+*.db
+*.db-shm
+*.db-wal
+*.log
+.DS_Store

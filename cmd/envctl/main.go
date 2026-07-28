@@ -1,0 +1,1378 @@
+package main
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/VeniVidiVici/envctl/internal/bun"
+	envconfig "github.com/VeniVidiVici/envctl/internal/config"
+	"github.com/VeniVidiVici/envctl/internal/customtool"
+	"github.com/VeniVidiVici/envctl/internal/decisionexport"
+	"github.com/VeniVidiVici/envctl/internal/executor"
+	"github.com/VeniVidiVici/envctl/internal/fleetrefresh"
+	"github.com/VeniVidiVici/envctl/internal/fleetui"
+	"github.com/VeniVidiVici/envctl/internal/homebrew"
+	"github.com/VeniVidiVici/envctl/internal/legacy"
+	"github.com/VeniVidiVici/envctl/internal/mas"
+	"github.com/VeniVidiVici/envctl/internal/model"
+	"github.com/VeniVidiVici/envctl/internal/planner"
+	"github.com/VeniVidiVici/envctl/internal/portablelink"
+	"github.com/VeniVidiVici/envctl/internal/remoteexec"
+	"github.com/VeniVidiVici/envctl/internal/stateboundary"
+	"github.com/VeniVidiVici/envctl/internal/store"
+)
+
+const usage = `envctl is a read-first macOS environment manager.
+
+Usage:
+  envctl audit --json [--state PATH] [--no-record]
+  envctl import-legacy --input PATH
+  envctl config resolve --config DIR --machine ID --json
+  envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
+  envctl apply --config DIR --machine ID [--manager brew|bun|mas] --json (--dry-run | --yes)
+  envctl history --json [--state PATH] [--limit N]
+  envctl tui --config DIR --inventory-dir DIR [--state PATH]
+  envctl fleet refresh --config DIR --inventory-dir DIR --json
+  envctl fleet export-decisions --config DIR [--state PATH] --json
+`
+
+func main() {
+	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
+		fmt.Fprintf(os.Stderr, "envctl: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 {
+		fmt.Fprint(stdout, usage)
+		return nil
+	}
+
+	switch args[0] {
+	case "audit":
+		return runAudit(ctx, args[1:], stdout, stderr)
+	case "import-legacy":
+		return runImportLegacy(args[1:], stdout, stderr)
+	case "plan":
+		return runPlan(ctx, args[1:], stdout, stderr)
+	case "apply":
+		return runApply(ctx, args[1:], stdout, stderr)
+	case "config":
+		return runConfig(args[1:], stdout, stderr)
+	case "history":
+		return runHistory(ctx, args[1:], stdout, stderr)
+	case "tui":
+		return runFleetTUI(ctx, args[1:], stderr)
+	case "fleet":
+		return runFleet(ctx, args[1:], stdout, stderr)
+	case "help", "-h", "--help":
+		fmt.Fprint(stdout, usage)
+		return nil
+	default:
+		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
+	}
+}
+
+type applyResponse struct {
+	Mode                   string               `json:"mode"`
+	MachineID              string               `json:"machine_id"`
+	AccessType             string               `json:"access_type"`
+	Manager                model.Manager        `json:"manager,omitempty"`
+	ConfigDigest           string               `json:"config_digest"`
+	Before                 model.Plan           `json:"before"`
+	Execution              executor.Report      `json:"execution"`
+	BlockedActions         []blockedAction      `json:"blocked_actions,omitempty"`
+	DeferredActions        []model.Action       `json:"deferred_actions,omitempty"`
+	MASPreflight           *mas.PreflightReport `json:"mas_preflight,omitempty"`
+	Ready                  bool                 `json:"ready"`
+	After                  *model.Plan          `json:"after,omitempty"`
+	RunID                  string               `json:"run_id,omitempty"`
+	PlanID                 string               `json:"plan_id,omitempty"`
+	VerificationSnapshotID string               `json:"verification_snapshot_id,omitempty"`
+	Verified               bool                 `json:"verified"`
+}
+
+type blockedAction struct {
+	Action model.Action `json:"action"`
+	Reason string       `json:"reason"`
+}
+
+func runApply(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("apply", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineID := flags.String("machine", "", "machine id from the native config")
+	managerName := flags.String(
+		"manager", "", "limit apply to one supported manager: brew, bun, or mas",
+	)
+	statePath := flags.String("state", "", "SQLite state database path")
+	dryRun := flags.Bool("dry-run", false, "validate and print commands without changing state")
+	yes := flags.Bool("yes", false, "confirm execution of the validated plan")
+	asJSON := flags.Bool("json", false, "print the apply report as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" || *machineID == "" {
+		return errors.New("--config and --machine are required")
+	}
+	if !*asJSON {
+		return errors.New("apply currently requires --json")
+	}
+	if *dryRun == *yes {
+		return errors.New("exactly one of --dry-run or --yes is required")
+	}
+	selectedManager, err := parseApplyManager(*managerName)
+	if err != nil {
+		return err
+	}
+	if selectedManager == model.ManagerMAS && *yes {
+		return errors.New(
+			"Mac App Store execution is not enabled; use --manager mas --dry-run",
+		)
+	}
+
+	loaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	beforeInventory, err := collectMachineInventory(ctx, loaded)
+	if err != nil {
+		return fmt.Errorf(
+			"collect live inventory for %s machine %q: %w",
+			loaded.Machine.Access.Type,
+			loaded.Machine.ID, err,
+		)
+	}
+	requiredCollector := collectorForApply(selectedManager)
+	if err := requireCollector(beforeInventory, requiredCollector); err != nil {
+		return fmt.Errorf(
+			"refuse apply without current %s inventory: %w",
+			requiredCollector, err,
+		)
+	}
+	beforePlan := planInventory(
+		loaded.Desired.Packages, loaded.Desired.Links, beforeInventory,
+	)
+	selectedActions, deferredActions := selectActions(
+		beforePlan.Actions, selectedManager,
+	)
+	if selectedManager == model.ManagerMAS {
+		actionRunner, err := executionRunnerFor(loaded)
+		if err != nil {
+			return err
+		}
+		preflight, err := mas.Preflight(
+			ctx, selectedActions, masOutputAdapter{runner: actionRunner},
+		)
+		if err != nil {
+			return err
+		}
+		blocked := make([]blockedAction, 0, len(selectedActions))
+		for _, action := range selectedActions {
+			blocked = append(blocked, blockedAction{
+				Action: action,
+				Reason: "Mac App Store execution is disabled; inspect mas_preflight",
+			})
+		}
+		response := applyResponse{
+			Mode:            "dry-run",
+			MachineID:       loaded.Machine.ID,
+			AccessType:      loaded.Machine.Access.Type,
+			Manager:         selectedManager,
+			ConfigDigest:    loaded.Digest,
+			Before:          beforePlan,
+			BlockedActions:  blocked,
+			DeferredActions: deferredActions,
+			MASPreflight:    &preflight,
+			Ready:           false,
+			Verified:        len(selectedActions) == 0,
+		}
+		return encodeJSON(stdout, response)
+	}
+	commands, blockedActions := classifyActions(selectedActions)
+	mode := "dry-run"
+	if *yes {
+		mode = "apply"
+	}
+	response := applyResponse{
+		Mode:            mode,
+		MachineID:       loaded.Machine.ID,
+		AccessType:      loaded.Machine.Access.Type,
+		Manager:         selectedManager,
+		ConfigDigest:    loaded.Digest,
+		Before:          beforePlan,
+		Execution:       executor.Report{Commands: commands},
+		BlockedActions:  blockedActions,
+		DeferredActions: deferredActions,
+		Ready:           len(blockedActions) == 0,
+		Verified:        len(selectedActions) == 0,
+	}
+	if *dryRun {
+		return encodeJSON(stdout, response)
+	}
+	if len(blockedActions) > 0 {
+		return fmt.Errorf(
+			"refuse mixed or unsupported apply plan: %d action(s) are blocked",
+			len(blockedActions),
+		)
+	}
+	if len(commands) == 0 {
+		return encodeJSON(stdout, response)
+	}
+
+	reloaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return fmt.Errorf("reload configuration before apply: %w", err)
+	}
+	if reloaded.Digest != loaded.Digest {
+		return errors.New("configuration changed during planning; rerun apply")
+	}
+	actionRunner, err := executionRunnerFor(reloaded)
+	if err != nil {
+		return err
+	}
+
+	databasePath := *statePath
+	if databasePath == "" {
+		databasePath = loaded.Database
+	}
+	state, err := openState(databasePath)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	hostname := reloaded.Machine.Access.Host
+	if reloaded.Machine.Access.Type == "local" {
+		hostname, err = os.Hostname()
+		if err != nil {
+			return fmt.Errorf("read hostname: %w", err)
+		}
+	}
+	machine := store.MachineInfo{ID: loaded.Machine.ID, Hostname: hostname}
+	beforeSnapshot, err := state.RecordAudit(ctx, machine, beforeInventory)
+	if err != nil {
+		return err
+	}
+	recordedPlan := scopedPlan(beforePlan, selectedActions, selectedManager)
+	commandName := "apply"
+	if selectedManager != "" {
+		commandName += " --manager " + string(selectedManager)
+	}
+	record, err := state.RecordPlan(
+		ctx, loaded.Machine.ID, beforeSnapshot.ID, loaded.Digest,
+		commandName, false, recordedPlan,
+	)
+	if err != nil {
+		return err
+	}
+	response.RunID = record.RunID
+	response.PlanID = record.PlanID
+	if err := state.BeginApply(ctx, record.RunID, record.PlanID); err != nil {
+		return err
+	}
+
+	report, applyErr := executor.New(
+		actionRunner,
+		stateActionJournal{state: state, planID: record.PlanID},
+	).Apply(ctx, selectedActions)
+	response.Execution = report
+
+	var completionErrors []error
+	afterInventory, afterCollectErr := collectMachineInventory(ctx, reloaded)
+	var collectorErr, verificationErr, snapshotErr error
+	if afterCollectErr != nil {
+		completionErrors = append(completionErrors,
+			fmt.Errorf("collect verification inventory: %w", afterCollectErr))
+	} else {
+		afterPlan := planInventory(
+			reloaded.Desired.Packages, reloaded.Desired.Links, afterInventory,
+		)
+		response.After = &afterPlan
+		collectorErr = requireCollector(afterInventory, requiredCollector)
+		verified, err := verifyActions(selectedActions, afterPlan)
+		verificationErr = err
+		response.Verified = verified && collectorErr == nil && applyErr == nil
+
+		afterSnapshot, err := state.RecordAudit(ctx, machine, afterInventory)
+		snapshotErr = err
+		if snapshotErr != nil {
+			completionErrors = append(completionErrors,
+				fmt.Errorf("record verification audit: %w", snapshotErr))
+		} else {
+			response.VerificationSnapshotID = afterSnapshot.ID
+		}
+	}
+	status := store.ActionStatusCompleted
+	if !response.Verified || afterCollectErr != nil || snapshotErr != nil {
+		status = store.ActionStatusFailed
+	}
+	if err := state.CompleteApply(
+		ctx, record.RunID, record.PlanID,
+		response.VerificationSnapshotID, status,
+	); err != nil {
+		completionErrors = append(completionErrors, err)
+	}
+	if err := encodeJSON(stdout, response); err != nil {
+		completionErrors = append(completionErrors, err)
+	}
+	if applyErr != nil {
+		completionErrors = append(completionErrors, applyErr)
+	}
+	if collectorErr != nil {
+		completionErrors = append(completionErrors,
+			fmt.Errorf("post-apply %s audit: %w",
+				requiredCollector, collectorErr))
+	}
+	if verificationErr != nil {
+		completionErrors = append(completionErrors, verificationErr)
+	}
+	return errors.Join(completionErrors...)
+}
+
+type masOutputAdapter struct {
+	runner executor.Runner
+}
+
+func (a masOutputAdapter) Output(
+	ctx context.Context,
+	name string,
+	args ...string,
+) ([]byte, error) {
+	stdout, _, err := a.runner.Run(ctx, name, args...)
+	if err != nil {
+		return nil, err
+	}
+	return []byte(stdout), nil
+}
+
+func parseApplyManager(value string) (model.Manager, error) {
+	switch model.Manager(value) {
+	case "":
+		return "", nil
+	case model.ManagerBrew, model.ManagerBun, model.ManagerMAS:
+		return model.Manager(value), nil
+	default:
+		return "", fmt.Errorf(
+			"unsupported --manager %q; expected brew, bun, or mas", value,
+		)
+	}
+}
+
+func collectorForApply(manager model.Manager) string {
+	if manager == model.ManagerBun {
+		return "bun"
+	}
+	if manager == model.ManagerMAS {
+		return "mas"
+	}
+	return "homebrew"
+}
+
+func selectActions(
+	actions []model.Action,
+	manager model.Manager,
+) ([]model.Action, []model.Action) {
+	if manager == "" {
+		return append([]model.Action(nil), actions...), nil
+	}
+	var selected, deferred []model.Action
+	for _, action := range actions {
+		if action.Manager == manager {
+			selected = append(selected, action)
+		} else {
+			deferred = append(deferred, action)
+		}
+	}
+	return selected, deferred
+}
+
+func scopedPlan(
+	plan model.Plan,
+	actions []model.Action,
+	manager model.Manager,
+) model.Plan {
+	scoped := plan
+	scoped.Actions = append([]model.Action(nil), actions...)
+	scoped.Summary.Actions = len(scoped.Actions)
+	if manager != "" {
+		scoped.Warnings = append(
+			append([]string(nil), plan.Warnings...),
+			fmt.Sprintf(
+				"apply was explicitly scoped to the %s manager; other findings were not actionable in this run",
+				manager,
+			),
+		)
+	}
+	return scoped
+}
+
+func executionRunnerFor(loaded envconfig.Loaded) (executor.Runner, error) {
+	switch loaded.Machine.Access.Type {
+	case "local":
+		return executor.ExecRunner{}, nil
+	case "ssh":
+		runner, err := remoteexec.New(loaded.Machine.Access.Host)
+		if err != nil {
+			return nil, err
+		}
+		return runner, nil
+	default:
+		return nil, fmt.Errorf(
+			"unsupported execution access type %q",
+			loaded.Machine.Access.Type,
+		)
+	}
+}
+
+func collectMachineInventory(
+	ctx context.Context,
+	loaded envconfig.Loaded,
+) (model.Inventory, error) {
+	if loaded.Machine.Access.Type == "local" {
+		return collectInventory(ctx, loaded.Desired.Links), nil
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return model.Inventory{}, fmt.Errorf("locate envctl executable: %w", err)
+	}
+	return fleetrefresh.New(
+		executable, "", fleetrefresh.ExecRunner{},
+	).Collect(ctx, fleetrefresh.Target{
+		ID:         loaded.Machine.ID,
+		AccessType: loaded.Machine.Access.Type,
+		Host:       loaded.Machine.Access.Host,
+		Links:      loaded.Desired.Links,
+	})
+}
+
+func classifyActions(
+	actions []model.Action,
+) ([]executor.Command, []blockedAction) {
+	commandPlanner := executor.New(nil, nil)
+	var commands []executor.Command
+	var blocked []blockedAction
+	for _, action := range actions {
+		planned, err := commandPlanner.Plan([]model.Action{action})
+		if err != nil {
+			blocked = append(blocked, blockedAction{
+				Action: action,
+				Reason: err.Error(),
+			})
+			continue
+		}
+		commands = append(commands, planned[0])
+	}
+	return commands, blocked
+}
+
+type stateActionJournal struct {
+	state  *store.Store
+	planID string
+}
+
+func (j stateActionJournal) StartAction(
+	ctx context.Context,
+	sequence int,
+) error {
+	return j.state.StartAction(ctx, j.planID, sequence)
+}
+
+func (j stateActionJournal) FinishAction(
+	ctx context.Context,
+	sequence int,
+	status, errorSummary string,
+) error {
+	return j.state.FinishAction(
+		ctx, j.planID, sequence, status, errorSummary,
+	)
+}
+
+func (j stateActionJournal) SkipAction(
+	ctx context.Context,
+	sequence int,
+	reason string,
+) error {
+	return j.state.SkipAction(ctx, j.planID, sequence, reason)
+}
+
+func planInventory(
+	desired []model.PackageSpec,
+	desiredLinks []model.LinkSpec,
+	inventory model.Inventory,
+) model.Plan {
+	plan := planner.Build(
+		desired, inventory.Packages, collectedManagers(inventory),
+	)
+	for _, collectorError := range inventory.Errors {
+		plan.Warnings = append(
+			plan.Warnings, inventoryWarning(collectorError),
+		)
+	}
+	if len(desiredLinks) > 0 {
+		summary, findings := planner.BuildLinks(
+			desiredLinks,
+			inventory.Links,
+			hasCollector(inventory, "portable-link"),
+		)
+		plan.LinkSummary = &summary
+		plan.LinkFindings = findings
+	}
+	return plan
+}
+
+func hasCollector(inventory model.Inventory, name string) bool {
+	for _, collector := range inventory.Collectors {
+		if collector == name {
+			return true
+		}
+	}
+	return false
+}
+
+func inventoryWarning(issue model.CollectorError) string {
+	if strings.HasPrefix(issue.Collector, "custom.") {
+		return fmt.Sprintf(
+			"%s probe issue: %s", issue.Collector, issue.Message,
+		)
+	}
+	if strings.HasPrefix(issue.Collector, "state-boundary.") {
+		return fmt.Sprintf(
+			"%s safety issue: %s", issue.Collector, issue.Message,
+		)
+	}
+	return fmt.Sprintf(
+		"%s collector failed: %s", issue.Collector, issue.Message,
+	)
+}
+
+func requireCollector(inventory model.Inventory, collector string) error {
+	for _, collected := range inventory.Collectors {
+		if collected == collector {
+			return nil
+		}
+	}
+	for _, collectorError := range inventory.Errors {
+		if collectorError.Collector == collector {
+			return errors.New(collectorError.Message)
+		}
+	}
+	return fmt.Errorf("%s collector did not report success", collector)
+}
+
+func verifyActions(actions []model.Action, after model.Plan) (bool, error) {
+	if len(actions) == 0 {
+		return true, nil
+	}
+	satisfied := make(map[string]bool)
+	for _, finding := range after.Findings {
+		if finding.Status == model.FindingSatisfied {
+			satisfied[finding.PackageID] = true
+		}
+	}
+	var missing []string
+	for _, action := range actions {
+		if !satisfied[action.PackageID] {
+			missing = append(missing, action.PackageID)
+		}
+	}
+	if len(missing) > 0 {
+		return false, fmt.Errorf(
+			"post-apply verification did not satisfy: %s",
+			strings.Join(missing, ", "),
+		)
+	}
+	return true, nil
+}
+
+func encodeJSON(writer io.Writer, value any) error {
+	encoder := json.NewEncoder(writer)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(value)
+}
+
+func runAudit(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("audit", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	asJSON := flags.Bool("json", false, "print the inventory as JSON")
+	machineID := flags.String("machine", "", "machine id used in local history")
+	statePath := flags.String("state", "", "SQLite state database path")
+	noRecord := flags.Bool("no-record", false, "do not write the local audit history")
+	encodedLinkSpecs := flags.String(
+		"link-specs", "", "base64url-encoded portable link specifications",
+	)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if !*asJSON {
+		return errors.New("the initial audit command currently requires --json")
+	}
+
+	linkSpecs, err := decodeLinkSpecs(*encodedLinkSpecs)
+	if err != nil {
+		return err
+	}
+	inventory := collectInventory(ctx, linkSpecs)
+	if !*noRecord {
+		resolvedMachineID, hostname, err := resolveMachineIdentity(*machineID)
+		if err != nil {
+			return err
+		}
+		state, err := openState(*statePath)
+		if err != nil {
+			return err
+		}
+		defer state.Close()
+		snapshot, err := state.RecordAudit(ctx, store.MachineInfo{
+			ID: resolvedMachineID, Hostname: hostname,
+		}, inventory)
+		if err != nil {
+			return err
+		}
+		if _, err := state.RecordAuditRun(
+			ctx, resolvedMachineID, snapshot.ID, false,
+		); err != nil {
+			return err
+		}
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(inventory)
+}
+
+func runImportLegacy(args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("import-legacy", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	input := flags.String("input", "", "path to the legacy apps-config.json")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *input == "" {
+		return errors.New("--input is required")
+	}
+
+	draft, err := legacy.LoadFile(*input)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(draft)
+}
+
+func runPlan(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("plan", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	legacyPath := flags.String("legacy", "", "path to the legacy apps-config.json")
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineIDFlag := flags.String("machine", "", "machine id from the native config")
+	statePath := flags.String("state", "", "SQLite state database path")
+	inventoryPath := flags.String("inventory", "", "saved inventory JSON instead of a live audit")
+	noRecord := flags.Bool("no-record", false, "do not write local audit and plan history")
+	asJSON := flags.Bool("json", false, "print the plan as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if (*legacyPath == "") == (*configRoot == "") {
+		return errors.New("exactly one of --config or --legacy is required")
+	}
+	if !*asJSON {
+		return errors.New("the initial plan command currently requires --json")
+	}
+
+	var (
+		desired        []model.PackageSpec
+		desiredLinks   []model.LinkSpec
+		configDigest   string
+		configDatabase string
+		machineID      string
+		hostname       string
+		configWarnings []string
+		legacyMode     bool
+	)
+	if *configRoot != "" {
+		if *machineIDFlag == "" {
+			return errors.New("--machine is required with --config")
+		}
+		loaded, err := envconfig.Load(*configRoot, *machineIDFlag)
+		if err != nil {
+			return err
+		}
+		desired = loaded.Desired.Packages
+		desiredLinks = loaded.Desired.Links
+		configDigest = loaded.Digest
+		configDatabase = loaded.Database
+		machineID = loaded.Machine.ID
+		hostname, err = os.Hostname()
+		if err != nil {
+			return fmt.Errorf("read hostname: %w", err)
+		}
+	} else {
+		draft, err := legacy.LoadFile(*legacyPath)
+		if err != nil {
+			return err
+		}
+		desired = draft.Packages
+		configWarnings = draft.Warnings
+		configDigest, err = digestFile(*legacyPath)
+		if err != nil {
+			return err
+		}
+		machineID, hostname, err = resolveMachineIdentity(*machineIDFlag)
+		if err != nil {
+			return err
+		}
+		legacyMode = true
+	}
+	var inventory model.Inventory
+	if *inventoryPath == "" {
+		inventory = collectInventory(ctx, desiredLinks)
+	} else {
+		loadedInventory, err := loadInventory(*inventoryPath)
+		if err != nil {
+			return err
+		}
+		inventory = loadedInventory
+	}
+	managers := collectedManagers(inventory)
+	var resolutionWarnings []string
+	if legacyMode {
+		desired, resolutionWarnings = resolveMissingHomebrew(ctx, desired, inventory.Packages)
+	}
+	plan := planner.Build(desired, inventory.Packages, managers)
+	if len(desiredLinks) > 0 {
+		linkSummary, linkFindings := planner.BuildLinks(
+			desiredLinks,
+			inventory.Links,
+			hasCollector(inventory, "portable-link"),
+		)
+		plan.LinkSummary = &linkSummary
+		plan.LinkFindings = linkFindings
+	}
+	plan.Warnings = append(configWarnings, plan.Warnings...)
+	plan.Warnings = append(resolutionWarnings, plan.Warnings...)
+	for _, collectorError := range inventory.Errors {
+		plan.Warnings = append(
+			plan.Warnings, inventoryWarning(collectorError),
+		)
+	}
+	if !*noRecord {
+		databasePath := *statePath
+		if databasePath == "" {
+			databasePath = configDatabase
+		}
+		state, err := openState(databasePath)
+		if err != nil {
+			return err
+		}
+		defer state.Close()
+		snapshot, err := state.RecordAudit(ctx, store.MachineInfo{
+			ID: machineID, Hostname: hostname,
+		}, inventory)
+		if err != nil {
+			return err
+		}
+		if _, err := state.RecordPlan(
+			ctx, machineID, snapshot.ID, configDigest, "plan", false, plan,
+		); err != nil {
+			return err
+		}
+	}
+
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(plan)
+}
+
+func runConfig(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 || args[0] != "resolve" {
+		return errors.New("usage: envctl config resolve --config DIR --machine ID --json")
+	}
+	flags := flag.NewFlagSet("config resolve", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineID := flags.String("machine", "", "machine id to resolve")
+	asJSON := flags.Bool("json", false, "print the resolved configuration as JSON")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *configRoot == "" || *machineID == "" {
+		return errors.New("--config and --machine are required")
+	}
+	if !*asJSON {
+		return errors.New("the initial config resolve command currently requires --json")
+	}
+	loaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(loaded)
+}
+
+func runHistory(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	flags := flag.NewFlagSet("history", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	statePath := flags.String("state", "", "SQLite state database path")
+	limit := flags.Int("limit", 20, "maximum number of runs")
+	asJSON := flags.Bool("json", false, "print run history as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if !*asJSON {
+		return errors.New("the initial history command currently requires --json")
+	}
+	state, err := openState(*statePath)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	history, err := state.History(ctx, *limit)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(history)
+}
+
+func runFleetTUI(ctx context.Context, args []string, stderr io.Writer) error {
+	flags := flag.NewFlagSet("tui", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	inventoryDirectory := flags.String(
+		"inventory-dir", "", "directory containing MACHINE.json audit files",
+	)
+	statePath := flags.String("state", "", "SQLite state database path")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" || *inventoryDirectory == "" {
+		return errors.New("--config and --inventory-dir are required")
+	}
+	expandedInventoryDirectory, err := expandHome(*inventoryDirectory)
+	if err != nil {
+		return err
+	}
+	machineIDs, err := envconfig.MachineIDs(*configRoot)
+	if err != nil {
+		return err
+	}
+	if len(machineIDs) == 0 {
+		return errors.New("native configuration contains no machines")
+	}
+
+	var (
+		machines       []fleetui.Machine
+		configDatabase string
+	)
+	refreshStatus, refreshStatusErr := fleetrefresh.LoadStatus(expandedInventoryDirectory)
+	refreshResults := make(map[string]fleetrefresh.Result)
+	if refreshStatusErr != nil && !errors.Is(refreshStatusErr, os.ErrNotExist) {
+		return fmt.Errorf("load fleet refresh status: %w", refreshStatusErr)
+	}
+	if refreshStatusErr == nil {
+		for _, result := range refreshStatus.Results {
+			refreshResults[result.MachineID] = result
+		}
+	}
+	for _, machineID := range machineIDs {
+		loaded, err := envconfig.Load(*configRoot, machineID)
+		if err != nil {
+			return err
+		}
+		if configDatabase == "" {
+			configDatabase = loaded.Database
+		}
+		inventory, err := loadInventory(
+			filepath.Join(expandedInventoryDirectory, machineID+".json"),
+		)
+		if err != nil {
+			return fmt.Errorf("load %s inventory: %w", machineID, err)
+		}
+		plan := planInventory(
+			loaded.Desired.Packages, loaded.Desired.Links, inventory,
+		)
+		refreshResult := refreshResults[machineID]
+		machines = append(machines, fleetui.Machine{
+			ID: machineID, Profiles: loaded.Desired.Profiles, Plan: plan,
+			CollectedAt:      inventory.CollectedAt,
+			RefreshStatus:    refreshResult.Status,
+			RefreshError:     refreshResult.Error,
+			RetainedLastGood: refreshResult.RetainedLastGood,
+		})
+	}
+
+	databasePath := *statePath
+	if databasePath == "" {
+		databasePath = configDatabase
+	}
+	state, err := openState(databasePath)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	for _, machine := range machines {
+		if err := state.EnsureMachine(ctx, store.MachineInfo{
+			ID: machine.ID, Hostname: machine.ID,
+		}); err != nil {
+			return err
+		}
+	}
+	storedDecisions, err := state.LatestDecisions(ctx, "")
+	if err != nil {
+		return err
+	}
+	decisions := make([]fleetui.Decision, 0, len(storedDecisions))
+	for _, decision := range storedDecisions {
+		decisions = append(decisions, fleetui.Decision{
+			MachineID: decision.MachineID, InventoryKey: decision.InventoryKey,
+			Value: decision.Value,
+		})
+	}
+	return fleetui.Run(fleetui.New(
+		machines,
+		decisions,
+		stateDecisionWriter{ctx: ctx, state: state},
+	))
+}
+
+func runFleet(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	if len(args) == 0 {
+		return errors.New("usage: envctl fleet refresh --config DIR --inventory-dir DIR --json")
+	}
+	switch args[0] {
+	case "refresh":
+		return runFleetRefresh(ctx, args[1:], stdout, stderr)
+	case "export-decisions":
+		return runFleetExportDecisions(ctx, args[1:], stdout, stderr)
+	default:
+		return fmt.Errorf("unknown fleet command %q", args[0])
+	}
+}
+
+func runFleetExportDecisions(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("fleet export-decisions", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	statePath := flags.String("state", "", "SQLite state database path")
+	outputPath := flags.String(
+		"output", "reviews/fleet-decisions.yaml",
+		"output path relative to the config root",
+	)
+	asJSON := flags.Bool("json", false, "print export result as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" {
+		return errors.New("--config is required")
+	}
+	if !*asJSON {
+		return errors.New("the initial decision export command currently requires --json")
+	}
+	machineIDs, err := envconfig.MachineIDs(*configRoot)
+	if err != nil {
+		return err
+	}
+	if len(machineIDs) == 0 {
+		return errors.New("native configuration contains no machines")
+	}
+	databasePath := *statePath
+	if databasePath == "" {
+		loaded, err := envconfig.Load(*configRoot, machineIDs[0])
+		if err != nil {
+			return err
+		}
+		databasePath = loaded.Database
+	}
+	state, err := openState(databasePath)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	decisions, err := state.LatestDecisions(ctx, "")
+	if err != nil {
+		return err
+	}
+	knownMachines := make(map[string]bool)
+	for _, machineID := range machineIDs {
+		knownMachines[machineID] = true
+	}
+	result, err := decisionexport.Write(
+		*configRoot, *outputPath, decisions, knownMachines,
+	)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(result)
+}
+
+func runFleetRefresh(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("fleet refresh", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	inventoryDirectory := flags.String(
+		"inventory-dir", "", "directory for per-machine audit files",
+	)
+	selectedMachines := flags.String(
+		"machines", "", "comma-separated machine ids; defaults to all",
+	)
+	asJSON := flags.Bool("json", false, "print refresh status as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" || *inventoryDirectory == "" {
+		return errors.New("--config and --inventory-dir are required")
+	}
+	if !*asJSON {
+		return errors.New("the initial fleet refresh command currently requires --json")
+	}
+	expandedInventoryDirectory, err := expandHome(*inventoryDirectory)
+	if err != nil {
+		return err
+	}
+	machineIDs, err := envconfig.MachineIDs(*configRoot)
+	if err != nil {
+		return err
+	}
+	if *selectedMachines != "" {
+		machineIDs, err = selectMachineIDs(machineIDs, *selectedMachines)
+		if err != nil {
+			return err
+		}
+	}
+	targets := make([]fleetrefresh.Target, 0, len(machineIDs))
+	for _, machineID := range machineIDs {
+		loaded, err := envconfig.Load(*configRoot, machineID)
+		if err != nil {
+			return err
+		}
+		targets = append(targets, fleetrefresh.Target{
+			ID: machineID, AccessType: loaded.Machine.Access.Type,
+			Host: loaded.Machine.Access.Host, Links: loaded.Desired.Links,
+		})
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate envctl executable: %w", err)
+	}
+	status, err := fleetrefresh.New(
+		executable,
+		expandedInventoryDirectory,
+		fleetrefresh.ExecRunner{},
+	).Refresh(ctx, targets)
+	if err != nil {
+		return err
+	}
+	encoder := json.NewEncoder(stdout)
+	encoder.SetIndent("", "  ")
+	return encoder.Encode(status)
+}
+
+type stateDecisionWriter struct {
+	ctx   context.Context
+	state *store.Store
+}
+
+func (w stateDecisionWriter) SaveDecision(
+	machineID, inventoryKey, value, profile string,
+) error {
+	_, err := w.state.RecordDecision(
+		w.ctx, machineID, inventoryKey, value, profile, "fleet TUI",
+	)
+	return err
+}
+
+func collectInventory(
+	ctx context.Context,
+	linkSpecs []model.LinkSpec,
+) model.Inventory {
+	inventory := model.Inventory{CollectedAt: time.Now().UTC()}
+
+	collect := func(
+		name string,
+		collector func(context.Context) ([]model.InstalledPackage, error),
+	) {
+		packages, err := collector(ctx)
+		if err != nil {
+			inventory.Errors = append(inventory.Errors, model.CollectorError{
+				Collector: name,
+				Message:   err.Error(),
+			})
+			return
+		}
+		inventory.Collectors = append(inventory.Collectors, name)
+		inventory.Packages = append(inventory.Packages, packages...)
+	}
+
+	collect("homebrew", homebrew.NewCollector(homebrew.ExecRunner{}).Collect)
+	collect("mas", mas.NewCollector(mas.ExecRunner{}).Collect)
+	bunCollector, err := bun.DefaultCollector()
+	if err != nil {
+		inventory.Errors = append(inventory.Errors, model.CollectorError{
+			Collector: "bun",
+			Message:   err.Error(),
+		})
+	} else {
+		collect("bun", bunCollector.Collect)
+	}
+	customResult := customtool.NewCollector(customtool.ExecRunner{}).Collect(ctx)
+	inventory.Collectors = append(inventory.Collectors, "custom")
+	inventory.Packages = append(inventory.Packages, customResult.Packages...)
+	for _, issue := range customResult.Issues {
+		inventory.Errors = append(inventory.Errors, model.CollectorError{
+			Collector: "custom." + issue.Tool,
+			Message:   issue.Message,
+		})
+	}
+	boundaryCollector, err := stateboundary.DefaultCollector()
+	if err != nil {
+		inventory.Errors = append(inventory.Errors, model.CollectorError{
+			Collector: "state-boundary",
+			Message:   err.Error(),
+		})
+	} else {
+		inventory.Collectors = append(inventory.Collectors, "state-boundary")
+		for _, issue := range boundaryCollector.Collect() {
+			inventory.Errors = append(inventory.Errors, model.CollectorError{
+				Collector: "state-boundary." + issue.ID,
+				Message:   issue.Message,
+			})
+		}
+	}
+	if len(linkSpecs) > 0 {
+		inventory.Collectors = append(inventory.Collectors, "portable-link")
+		inventory.Links = portablelink.Collect(linkSpecs)
+	}
+	return inventory
+}
+
+func decodeLinkSpecs(encoded string) ([]model.LinkSpec, error) {
+	if encoded == "" {
+		return nil, nil
+	}
+	if len(encoded) > 128*1024 {
+		return nil, errors.New("portable link specification payload is too large")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("decode portable link specifications: %w", err)
+	}
+	var specs []model.LinkSpec
+	decoder := json.NewDecoder(strings.NewReader(string(raw)))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&specs); err != nil {
+		return nil, fmt.Errorf("parse portable link specifications: %w", err)
+	}
+	if len(specs) > 256 {
+		return nil, errors.New("too many portable link specifications")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, fmt.Errorf("find home directory: %w", err)
+	}
+	for _, spec := range specs {
+		decodedDigest, digestErr := hex.DecodeString(spec.Digest)
+		if spec.ID == "" || spec.Kind != model.LinkKindFile ||
+			!pathWithin(home, spec.Source) || !pathWithin(home, spec.Target) ||
+			digestErr != nil || len(decodedDigest) != sha256.Size {
+			return nil, fmt.Errorf("unsafe portable link specification %q", spec.ID)
+		}
+	}
+	return specs, nil
+}
+
+func pathWithin(root, path string) bool {
+	if !filepath.IsAbs(path) {
+		return false
+	}
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." &&
+		!strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func collectedManagers(inventory model.Inventory) []model.Manager {
+	var managers []model.Manager
+	for _, collector := range inventory.Collectors {
+		switch collector {
+		case "homebrew":
+			managers = append(managers, model.ManagerBrew)
+		case "mas":
+			managers = append(managers, model.ManagerMAS)
+		case "bun":
+			managers = append(managers, model.ManagerBun)
+		case "custom":
+			managers = append(managers, model.ManagerCustom)
+		}
+	}
+	return managers
+}
+
+func resolveMissingHomebrew(
+	ctx context.Context,
+	desired []model.PackageSpec,
+	installed []model.InstalledPackage,
+) ([]model.PackageSpec, []string) {
+	resolved := append([]model.PackageSpec(nil), desired...)
+	resolver := homebrew.NewResolver(homebrew.ExecRunner{})
+	var warnings []string
+
+	for index, wanted := range resolved {
+		if wanted.Manager != model.ManagerBrew ||
+			(wanted.Kind != "" && wanted.Kind != model.KindUnknown) ||
+			hasInstalledPackage(installed, wanted.Manager, wanted.Package) {
+			continue
+		}
+		item, err := resolver.Resolve(ctx, wanted)
+		if err != nil {
+			warnings = append(warnings, err.Error())
+			continue
+		}
+		resolved[index] = item
+	}
+	return resolved, warnings
+}
+
+func hasInstalledPackage(
+	installed []model.InstalledPackage,
+	manager model.Manager,
+	name string,
+) bool {
+	for _, item := range installed {
+		if item.Manager == manager && item.Package == name {
+			return true
+		}
+	}
+	return false
+}
+
+func openState(path string) (*store.Store, error) {
+	if path == "" {
+		var err error
+		path, err = defaultStatePath()
+		if err != nil {
+			return nil, err
+		}
+	}
+	expanded, err := expandHome(path)
+	if err != nil {
+		return nil, err
+	}
+	return store.Open(expanded)
+}
+
+func defaultStatePath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("find home directory: %w", err)
+	}
+	return filepath.Join(home, ".local", "state", "envctl", "state.db"), nil
+}
+
+func expandHome(path string) (string, error) {
+	if path == "~" {
+		return os.UserHomeDir()
+	}
+	if !strings.HasPrefix(path, "~/") {
+		return path, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("find home directory: %w", err)
+	}
+	return filepath.Join(home, strings.TrimPrefix(path, "~/")), nil
+}
+
+func resolveMachineIdentity(configured string) (string, string, error) {
+	hostname, err := os.Hostname()
+	if err != nil {
+		return "", "", fmt.Errorf("read hostname: %w", err)
+	}
+	if configured == "" {
+		configured = hostname
+	}
+	return configured, hostname, nil
+}
+
+func digestFile(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read configuration for digest: %w", err)
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(raw)), nil
+}
+
+func selectMachineIDs(available []string, selection string) ([]string, error) {
+	known := make(map[string]bool)
+	for _, machineID := range available {
+		known[machineID] = true
+	}
+	var selected []string
+	seen := make(map[string]bool)
+	for _, value := range strings.Split(selection, ",") {
+		machineID := strings.TrimSpace(value)
+		if machineID == "" {
+			continue
+		}
+		if !known[machineID] {
+			return nil, fmt.Errorf("unknown selected machine %q", machineID)
+		}
+		if !seen[machineID] {
+			selected = append(selected, machineID)
+			seen[machineID] = true
+		}
+	}
+	if len(selected) == 0 {
+		return nil, errors.New("--machines selected no machines")
+	}
+	return selected, nil
+}
+
+func loadInventory(path string) (model.Inventory, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return model.Inventory{}, fmt.Errorf("open saved inventory: %w", err)
+	}
+	defer file.Close()
+
+	var inventory model.Inventory
+	decoder := json.NewDecoder(file)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&inventory); err != nil {
+		return model.Inventory{}, fmt.Errorf("decode saved inventory: %w", err)
+	}
+	if inventory.CollectedAt.IsZero() {
+		return model.Inventory{}, errors.New("saved inventory has no collection time")
+	}
+	return inventory, nil
+}

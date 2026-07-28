@@ -1,0 +1,16 @@
+version: 1
+
+packages:
+  fzf:
+    manager: brew
+    kind: formula
+    source: homebrew/core
+    package: fzf
+    update_policy: managed
+
+  example-store-app:
+    manager: mas
+    kind: app
+    source: mac-app-store
+    package: "123456789"
+    update_policy: managed

@@ -1,0 +1,8 @@
+version: 1
+name: development
+
+extends:
+  - base
+
+packages:
+  - example-store-app

@@ -1,0 +1,8 @@
+version: 1
+
+catalog: catalog/packages.yaml
+profiles: profiles
+machines: machines
+
+state:
+  database: ~/.local/state/envctl/state.db
