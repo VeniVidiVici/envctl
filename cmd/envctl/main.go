@@ -46,6 +46,7 @@ Usage:
   envctl config resolve --config DIR --machine ID --json
   envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
   envctl apply --config DIR --machine ID [--local] [--manager brew|bun|mas] --json (--dry-run | --yes)
+  envctl links apply --config DIR --machine ID --local --json (--dry-run | --yes)
   envctl history --json [--state PATH] [--limit N]
   envctl tui --config DIR --inventory-dir DIR [--state PATH]
   envctl fleet refresh --config DIR --inventory-dir DIR --json
@@ -80,6 +81,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runPlan(ctx, args[1:], stdout, stderr)
 	case "apply":
 		return runApply(ctx, args[1:], stdout, stderr)
+	case "links":
+		return runLinks(ctx, args[1:], stdout, stderr)
 	case "config":
 		return runConfig(args[1:], stdout, stderr)
 	case "history":
@@ -156,6 +159,280 @@ func runOnboard(
 	return onboardui.Run(onboardui.New(
 		result, *configRoot, onboardui.FileWriter{},
 	))
+}
+
+type linkApplyResponse struct {
+	Mode                   string                          `json:"mode"`
+	MachineID              string                          `json:"machine_id"`
+	ConfigDigest           string                          `json:"config_digest"`
+	Plan                   portablelink.TransactionPlan    `json:"plan"`
+	Result                 *portablelink.TransactionResult `json:"result,omitempty"`
+	RunID                  string                          `json:"run_id,omitempty"`
+	PlanID                 string                          `json:"plan_id,omitempty"`
+	VerificationSnapshotID string                          `json:"verification_snapshot_id,omitempty"`
+}
+
+func runLinks(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	if len(args) == 0 || args[0] != "apply" {
+		return errors.New(
+			"usage: envctl links apply --config DIR --machine ID " +
+				"--local --json (--dry-run | --yes)",
+		)
+	}
+	flags := flag.NewFlagSet("links apply", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineID := flags.String("machine", "", "machine id from the native config")
+	localMachine := flags.Bool(
+		"local", false,
+		"require this Mac's registered identity and execute locally",
+	)
+	backupDirectory := flags.String(
+		"backup-dir", "", "portable-link backup directory inside the home directory",
+	)
+	statePath := flags.String("state", "", "SQLite state database path")
+	dryRun := flags.Bool("dry-run", false, "print the transaction without changing links")
+	yes := flags.Bool("yes", false, "confirm the validated link transaction")
+	asJSON := flags.Bool("json", false, "print the link transaction as JSON")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *configRoot == "" || *machineID == "" {
+		return errors.New("--config and --machine are required")
+	}
+	if !*localMachine {
+		return errors.New("portable-link apply currently requires --local")
+	}
+	if !*asJSON {
+		return errors.New("portable-link apply currently requires --json")
+	}
+	if *dryRun == *yes {
+		return errors.New("exactly one of --dry-run or --yes is required")
+	}
+
+	loaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	if err := forceLocalMachine(ctx, &loaded); err != nil {
+		return err
+	}
+	if len(loaded.Desired.Links) == 0 {
+		return errors.New("machine has no desired portable links")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("find home directory: %w", err)
+	}
+	resolvedBackup := *backupDirectory
+	if resolvedBackup == "" {
+		resolvedBackup = filepath.Join(
+			home, ".local", "state", "envctl", "backups", "portable-links",
+		)
+	} else {
+		resolvedBackup, err = expandHome(resolvedBackup)
+		if err != nil {
+			return err
+		}
+	}
+	transaction, err := portablelink.NewTransaction(home, resolvedBackup)
+	if err != nil {
+		return err
+	}
+	plan, err := transaction.Plan(loaded.Desired.Links)
+	if err != nil {
+		return err
+	}
+	mode := "dry-run"
+	if *yes {
+		mode = "apply"
+	}
+	response := linkApplyResponse{
+		Mode: mode, MachineID: loaded.Machine.ID,
+		ConfigDigest: loaded.Digest, Plan: plan,
+	}
+	if *dryRun {
+		return encodeJSON(stdout, response)
+	}
+	if !plan.Ready {
+		return fmt.Errorf(
+			"refuse portable-link transaction with %d blocker(s)",
+			len(plan.Blockers),
+		)
+	}
+	reloaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return fmt.Errorf("reload configuration before link apply: %w", err)
+	}
+	if err := forceLocalMachine(ctx, &reloaded); err != nil {
+		return err
+	}
+	if reloaded.Digest != loaded.Digest {
+		return errors.New("configuration changed during link planning; rerun links apply")
+	}
+	databasePath := *statePath
+	if databasePath == "" {
+		databasePath = loaded.Database
+	}
+	state, err := openState(databasePath)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	hostname, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("read hostname: %w", err)
+	}
+	machine := store.MachineInfo{
+		ID: loaded.Machine.ID, Hostname: hostname,
+	}
+	beforeInventory := model.Inventory{
+		CollectedAt: time.Now().UTC(),
+		Collectors:  []string{"portable-link"},
+		Links:       portablelink.Collect(loaded.Desired.Links),
+	}
+	beforeSnapshot, err := state.RecordAudit(ctx, machine, beforeInventory)
+	if err != nil {
+		return err
+	}
+	record, err := state.RecordLinkPlan(
+		ctx,
+		loaded.Machine.ID,
+		beforeSnapshot.ID,
+		loaded.Digest,
+		"links apply",
+		false,
+		plan,
+	)
+	if err != nil {
+		return err
+	}
+	response.RunID = record.RunID
+	response.PlanID = record.PlanID
+	if err := state.BeginApply(ctx, record.RunID, record.PlanID); err != nil {
+		return err
+	}
+
+	result, applyErr := transaction.Apply(
+		ctx,
+		plan,
+		reloaded.Desired.Links,
+		stateLinkJournal{state: state, planID: record.PlanID},
+	)
+	response.Result = &result
+	afterInventory := model.Inventory{
+		CollectedAt: time.Now().UTC(),
+		Collectors:  []string{"portable-link"},
+		Links:       portablelink.Collect(reloaded.Desired.Links),
+	}
+	afterSnapshot, snapshotErr := state.RecordAudit(ctx, machine, afterInventory)
+	if snapshotErr == nil {
+		response.VerificationSnapshotID = afterSnapshot.ID
+	}
+	completionStatus := store.ActionStatusCompleted
+	if applyErr != nil || !result.Verified || snapshotErr != nil {
+		completionStatus = store.ActionStatusFailed
+	}
+	var completionErrors []error
+	if applyErr != nil {
+		completionErrors = append(completionErrors, applyErr)
+		if err := state.SkipProposedActions(
+			ctx, record.PlanID, applyErr.Error(),
+		); err != nil {
+			completionErrors = append(completionErrors, err)
+		}
+	}
+	if snapshotErr != nil {
+		completionErrors = append(
+			completionErrors,
+			fmt.Errorf("record link verification snapshot: %w", snapshotErr),
+		)
+	}
+	verificationID := ""
+	if snapshotErr == nil {
+		verificationID = afterSnapshot.ID
+	}
+	if err := state.CompleteApply(
+		ctx,
+		record.RunID,
+		record.PlanID,
+		verificationID,
+		completionStatus,
+	); err != nil {
+		completionErrors = append(completionErrors, err)
+	}
+	if err := encodeJSON(stdout, response); err != nil {
+		return err
+	}
+	return errors.Join(completionErrors...)
+}
+
+type stateLinkJournal struct {
+	state  *store.Store
+	planID string
+}
+
+func (j stateLinkJournal) StartLink(
+	ctx context.Context,
+	action portablelink.LinkAction,
+) error {
+	return j.state.StartAction(ctx, j.planID, action.Sequence)
+}
+
+func (j stateLinkJournal) CompleteLink(
+	ctx context.Context,
+	action portablelink.LinkAction,
+) error {
+	if action.BackupPath != "" {
+		if err := j.state.RecordActionBackup(
+			ctx,
+			j.planID,
+			action.Sequence,
+			action.Target,
+			action.BackupPath,
+			action.ExpectedLinkTarget,
+		); err != nil {
+			return err
+		}
+	}
+	return j.state.FinishAction(
+		ctx,
+		j.planID,
+		action.Sequence,
+		store.ActionStatusCompleted,
+		"",
+	)
+}
+
+func (j stateLinkJournal) FailLink(
+	ctx context.Context,
+	action portablelink.LinkAction,
+	reason string,
+) error {
+	return j.state.FinishAction(
+		ctx,
+		j.planID,
+		action.Sequence,
+		store.ActionStatusFailed,
+		reason,
+	)
+}
+
+func (j stateLinkJournal) RollBackLink(
+	ctx context.Context,
+	action portablelink.LinkAction,
+	reason string,
+) error {
+	return j.state.RollBackAction(
+		ctx,
+		j.planID,
+		action.Sequence,
+		reason,
+	)
 }
 
 type applyResponse struct {

@@ -198,6 +198,20 @@ func (m *Model) View() tea.View {
 				"    --machine %s --local --dry-run --json\n",
 				m.result.MachineID,
 			))
+			if m.result.Plan.LinkSummary != nil {
+				links := m.result.Plan.LinkSummary
+				if links.Missing+links.Drifted+links.NotChecked > 0 {
+					body.WriteString("\nPortable-link dry-run:\n")
+					body.WriteString(fmt.Sprintf(
+						"  envctl links apply --config %s \\\n",
+						m.configRoot,
+					))
+					body.WriteString(fmt.Sprintf(
+						"    --machine %s --local --dry-run --json\n",
+						m.result.MachineID,
+					))
+				}
+			}
 		}
 	} else if m.result.Proposal != nil {
 		body.WriteString(fmt.Sprintf(

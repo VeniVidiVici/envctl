@@ -5,12 +5,16 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/VeniVidiVici/envctl/internal/model"
+	"github.com/VeniVidiVici/envctl/internal/onboard"
+	"github.com/VeniVidiVici/envctl/internal/portablelink"
 )
 
 func TestHelp(t *testing.T) {
@@ -102,6 +106,121 @@ access:
 	}
 }
 
+func TestLinksApplyRunsVerifiedJournalledTransaction(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("portable-link local identity integration requires macOS")
+	}
+	ctx := context.Background()
+	identity, err := onboard.Detect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "env-config")
+	source := filepath.Join(root, "portable", "example")
+	oldSource := filepath.Join(home, "legacy", "example")
+	target := filepath.Join(home, ".config", "example", "config")
+	statePath := filepath.Join(home, ".local", "state", "envctl", "state.db")
+	writeMainTestFile(t, source, "new\n")
+	writeMainTestFile(t, oldSource, "old\n")
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldRelative, err := filepath.Rel(filepath.Dir(target), oldSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(oldRelative, target); err != nil {
+		t.Fatal(err)
+	}
+	writeMainTestFile(t, filepath.Join(root, "envctl.yaml"), fmt.Sprintf(`
+version: 1
+catalog: catalog/packages.yaml
+profiles: profiles
+machines: machines
+state:
+  database: %s
+`, statePath))
+	writeMainTestFile(t, filepath.Join(root, "catalog", "packages.yaml"), `
+version: 1
+packages:
+  example:
+    manager: manual
+    kind: tool
+    package: example
+    update_policy: external
+links:
+  example:
+    source: portable/example
+    target: ~/.config/example/config
+    kind: file
+`)
+	writeMainTestFile(t, filepath.Join(root, "profiles", "shared.yaml"), `
+version: 1
+name: shared
+links:
+  - example
+`)
+	writeMainTestFile(t, filepath.Join(root, "machines", "example.yaml"), fmt.Sprintf(`
+version: 1
+id: example
+match:
+  hardware_uuid_sha256: %s
+profiles:
+  - shared
+access:
+  type: ssh
+  host: example
+`, identity.HardwareUUIDSHA256))
+
+	var stdout, stderr bytes.Buffer
+	err = run(ctx, []string{
+		"links", "apply",
+		"--config", root,
+		"--machine", "example",
+		"--local",
+		"--yes",
+		"--json",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("links apply error = %v\nstderr = %s", err, stderr.String())
+	}
+	var response linkApplyResponse
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Result == nil || !response.Result.Verified ||
+		response.RunID == "" || response.PlanID == "" ||
+		response.VerificationSnapshotID == "" {
+		t.Fatalf("response = %#v", response)
+	}
+	observation := portablelink.Collect([]model.LinkSpec{{
+		ID: "example", Source: source, Target: target, Kind: model.LinkKindFile,
+	}})[0]
+	if observation.ResolvedTarget != source {
+		t.Fatalf("observation = %#v", observation)
+	}
+	backup := response.Plan.Actions[0].BackupPath
+	if info, err := os.Lstat(backup); err != nil ||
+		info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("backup = %s, %v, %v", backup, info, err)
+	}
+	state, err := openState(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer state.Close()
+	history, err := state.History(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(history) != 1 || history[0].Command != "links apply" ||
+		history[0].Status != "completed" || history[0].ActionCount != 1 {
+		t.Fatalf("history = %#v", history)
+	}
+}
+
 func TestVerifyActionsRequiresSatisfiedFinding(t *testing.T) {
 	actions := []model.Action{{PackageID: "loc"}}
 	if verified, err := verifyActions(actions, model.Plan{
@@ -117,6 +236,16 @@ func TestVerifyActionsRequiresSatisfiedFinding(t *testing.T) {
 		}},
 	}); err != nil || !verified {
 		t.Fatalf("verifyActions() = %v, %v; want true, nil", verified, err)
+	}
+}
+
+func writeMainTestFile(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
 	}
 }
 
