@@ -120,12 +120,20 @@ func TestMatchedViewShowsLocalPlanSummary(t *testing.T) {
 				Satisfied: 4, Drifted: 1,
 			},
 		},
+		RecoveryPlan: &model.RecoveryPlan{
+			Summary: model.RecoveryPlanSummary{
+				Satisfied: 3,
+				Missing:   2,
+			},
+			Ready: true,
+		},
 	}, "/config", &fakeWriter{})
 
 	content := view.View().Content
 	for _, expected := range []string{
 		"matched example", "10 satisfied", "2 missing", "3 extra",
 		"Proposed package actions: 2", "Portable links: 4 satisfied",
+		"Credential recovery: 3 satisfied", "envctl recovery plan",
 		"Preview only", "--machine example --local --dry-run --json",
 		"envctl links apply",
 	} {

@@ -62,6 +62,24 @@ symlink into a timestamped machine-local backup, creates all links as one
 transaction, verifies every resulting target, and rolls earlier operations back
 if a later operation fails. It never replaces a regular file or directory.
 
+Credential recovery is independently planned and remains read-only:
+
+```sh
+envctl recovery plan \
+  --config /path/to/env-config \
+  --machine example-mac \
+  --local \
+  --json
+```
+
+Recovery declarations use fixed SOPS-file, age-archive, or GPG-keyring
+drivers—never configuration-supplied commands. The planner pins SOPS and age to
+the bootstrap-installed local age identity, decrypts only into bounded in-memory
+hashes or archive readers, and reports status without emitting plaintext or
+secret digests. It detects missing tools and sources, unsafe symlinks, occupied
+targets, permission drift, content drift, missing archive members, and an
+unexpected GPG fingerprint. It does not install recovery material.
+
 For a clean Mac, `scripts/bootstrap-macos` is the versioned bootstrap
 foundation. It expects the age identity and encrypted read-only `env-config`
 deploy key in iCloud's `Env Secrets` directory. It installs only the tools
@@ -99,6 +117,8 @@ go run ./cmd/envctl apply \
   --config ../env-config --machine matilda --manager mas --dry-run --json
 go run ./cmd/envctl links apply \
   --config ../env-config --machine ai --local --dry-run --json
+go run ./cmd/envctl recovery plan \
+  --config ../env-config --machine ai --local --json
 go run ./cmd/envctl config resolve \
   --config ./examples/env-config --machine example-mac --json
 go run ./cmd/envctl history --json

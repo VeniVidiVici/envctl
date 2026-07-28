@@ -178,6 +178,17 @@ func (m *Model) View() tea.View {
 					links.Drifted+links.NotChecked,
 				))
 			}
+			if m.result.RecoveryPlan != nil {
+				recovery := m.result.RecoveryPlan.Summary
+				body.WriteString(fmt.Sprintf(
+					"Credential recovery: %d satisfied   %d missing   %d drifted   %d blocked\n",
+					recovery.Satisfied,
+					recovery.Missing,
+					recovery.Drifted,
+					recovery.Blocked+recovery.ToolMissing+
+						recovery.SourceMissing+recovery.SourceUnsafe,
+				))
+			}
 			if len(m.result.Plan.Warnings) > 0 {
 				body.WriteString(fmt.Sprintf(
 					"Plan notes: %d\n",
@@ -208,6 +219,22 @@ func (m *Model) View() tea.View {
 					))
 					body.WriteString(fmt.Sprintf(
 						"    --machine %s --local --dry-run --json\n",
+						m.result.MachineID,
+					))
+				}
+			}
+			if m.result.RecoveryPlan != nil {
+				recovery := m.result.RecoveryPlan.Summary
+				if recovery.Missing+recovery.Drifted+recovery.Blocked+
+					recovery.ToolMissing+recovery.SourceMissing+
+					recovery.SourceUnsafe > 0 {
+					body.WriteString("\nCredential recovery plan:\n")
+					body.WriteString(fmt.Sprintf(
+						"  envctl recovery plan --config %s \\\n",
+						m.configRoot,
+					))
+					body.WriteString(fmt.Sprintf(
+						"    --machine %s --local --json\n",
 						m.result.MachineID,
 					))
 				}

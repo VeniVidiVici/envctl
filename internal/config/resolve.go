@@ -8,26 +8,30 @@ import (
 )
 
 type Catalog struct {
-	Packages map[string]model.PackageSpec `json:"packages" yaml:"packages"`
-	Links    map[string]model.LinkSpec    `json:"links,omitempty" yaml:"links,omitempty"`
+	Packages   map[string]model.PackageSpec  `json:"packages" yaml:"packages"`
+	Links      map[string]model.LinkSpec     `json:"links,omitempty" yaml:"links,omitempty"`
+	Recoveries map[string]model.RecoverySpec `json:"recoveries,omitempty" yaml:"recoveries,omitempty"`
 }
 
 type Profile struct {
-	Name     string   `json:"name" yaml:"name"`
-	Extends  []string `json:"extends,omitempty" yaml:"extends,omitempty"`
-	Packages []string `json:"packages,omitempty" yaml:"packages,omitempty"`
-	Links    []string `json:"links,omitempty" yaml:"links,omitempty"`
+	Name       string   `json:"name" yaml:"name"`
+	Extends    []string `json:"extends,omitempty" yaml:"extends,omitempty"`
+	Packages   []string `json:"packages,omitempty" yaml:"packages,omitempty"`
+	Links      []string `json:"links,omitempty" yaml:"links,omitempty"`
+	Recoveries []string `json:"recoveries,omitempty" yaml:"recoveries,omitempty"`
 }
 
 type Machine struct {
-	ID          string   `json:"id" yaml:"id"`
-	Match       Match    `json:"match,omitempty" yaml:"match,omitempty"`
-	Profiles    []string `json:"profiles" yaml:"profiles"`
-	Add         []string `json:"add,omitempty" yaml:"add,omitempty"`
-	Remove      []string `json:"remove,omitempty" yaml:"remove,omitempty"`
-	AddLinks    []string `json:"add_links,omitempty" yaml:"add_links,omitempty"`
-	RemoveLinks []string `json:"remove_links,omitempty" yaml:"remove_links,omitempty"`
-	Access      Access   `json:"access" yaml:"access"`
+	ID               string   `json:"id" yaml:"id"`
+	Match            Match    `json:"match,omitempty" yaml:"match,omitempty"`
+	Profiles         []string `json:"profiles" yaml:"profiles"`
+	Add              []string `json:"add,omitempty" yaml:"add,omitempty"`
+	Remove           []string `json:"remove,omitempty" yaml:"remove,omitempty"`
+	AddLinks         []string `json:"add_links,omitempty" yaml:"add_links,omitempty"`
+	RemoveLinks      []string `json:"remove_links,omitempty" yaml:"remove_links,omitempty"`
+	AddRecoveries    []string `json:"add_recoveries,omitempty" yaml:"add_recoveries,omitempty"`
+	RemoveRecoveries []string `json:"remove_recoveries,omitempty" yaml:"remove_recoveries,omitempty"`
+	Access           Access   `json:"access" yaml:"access"`
 }
 
 type Match struct {
@@ -40,15 +44,17 @@ type Access struct {
 }
 
 type DesiredState struct {
-	MachineID string              `json:"machine_id"`
-	Profiles  []string            `json:"profiles"`
-	Packages  []model.PackageSpec `json:"packages"`
-	Links     []model.LinkSpec    `json:"links,omitempty"`
+	MachineID  string               `json:"machine_id"`
+	Profiles   []string             `json:"profiles"`
+	Packages   []model.PackageSpec  `json:"packages"`
+	Links      []model.LinkSpec     `json:"links,omitempty"`
+	Recoveries []model.RecoverySpec `json:"recoveries,omitempty"`
 }
 
 func Resolve(catalog Catalog, profiles map[string]Profile, machine Machine) (DesiredState, error) {
 	selected := make(map[string]bool)
 	selectedLinks := make(map[string]bool)
+	selectedRecoveries := make(map[string]bool)
 	var profileOrder []string
 	visiting := make(map[string]bool)
 	visited := make(map[string]bool)
@@ -86,6 +92,16 @@ func Resolve(catalog Catalog, profiles map[string]Profile, machine Machine) (Des
 			}
 			selectedLinks[linkID] = true
 		}
+		for _, recoveryID := range profile.Recoveries {
+			if _, ok := catalog.Recoveries[recoveryID]; !ok {
+				return fmt.Errorf(
+					"profile %q references unknown recovery %q",
+					name,
+					recoveryID,
+				)
+			}
+			selectedRecoveries[recoveryID] = true
+		}
 		return nil
 	}
 
@@ -122,6 +138,22 @@ func Resolve(catalog Catalog, profiles map[string]Profile, machine Machine) (Des
 		}
 		delete(selectedLinks, linkID)
 	}
+	for _, recoveryID := range machine.AddRecoveries {
+		if _, ok := catalog.Recoveries[recoveryID]; !ok {
+			return DesiredState{}, fmt.Errorf(
+				"machine %q adds unknown recovery %q", machine.ID, recoveryID,
+			)
+		}
+		selectedRecoveries[recoveryID] = true
+	}
+	for _, recoveryID := range machine.RemoveRecoveries {
+		if _, ok := catalog.Recoveries[recoveryID]; !ok {
+			return DesiredState{}, fmt.Errorf(
+				"machine %q removes unknown recovery %q", machine.ID, recoveryID,
+			)
+		}
+		delete(selectedRecoveries, recoveryID)
+	}
 
 	packageIDs := make([]string, 0, len(selected))
 	for packageID := range selected {
@@ -153,6 +185,19 @@ func Resolve(catalog Catalog, profiles map[string]Profile, machine Machine) (Des
 			spec.ID = linkID
 		}
 		state.Links = append(state.Links, spec)
+	}
+	recoveryIDs := make([]string, 0, len(selectedRecoveries))
+	for recoveryID := range selectedRecoveries {
+		recoveryIDs = append(recoveryIDs, recoveryID)
+	}
+	sort.Strings(recoveryIDs)
+	state.Recoveries = make([]model.RecoverySpec, 0, len(recoveryIDs))
+	for _, recoveryID := range recoveryIDs {
+		spec := catalog.Recoveries[recoveryID]
+		if spec.ID == "" {
+			spec.ID = recoveryID
+		}
+		state.Recoveries = append(state.Recoveries, spec)
 	}
 	return state, nil
 }

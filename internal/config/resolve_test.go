@@ -17,12 +17,20 @@ func TestResolveComposesProfilesAndMachineOverlay(t *testing.T) {
 		"base-link":    {Source: "base", Target: "~/base"},
 		"removed-link": {Source: "removed", Target: "~/removed"},
 		"machine-link": {Source: "machine", Target: "~/machine"},
+	}, Recoveries: map[string]model.RecoverySpec{
+		"base-recovery":    {Kind: model.RecoveryKindSOPSFile},
+		"removed-recovery": {Kind: model.RecoveryKindSOPSFile},
+		"machine-recovery": {Kind: model.RecoveryKindSOPSFile},
 	}}
 	profiles := map[string]Profile{
 		"base": {
 			Name:     "base",
 			Packages: []string{"base-tool", "removed-tool"},
 			Links:    []string{"base-link", "removed-link"},
+			Recoveries: []string{
+				"base-recovery",
+				"removed-recovery",
+			},
 		},
 		"development": {
 			Name:     "development",
@@ -37,6 +45,12 @@ func TestResolveComposesProfilesAndMachineOverlay(t *testing.T) {
 		Remove:      []string{"removed-tool"},
 		AddLinks:    []string{"machine-link"},
 		RemoveLinks: []string{"removed-link"},
+		AddRecoveries: []string{
+			"machine-recovery",
+		},
+		RemoveRecoveries: []string{
+			"removed-recovery",
+		},
 	}
 
 	got, err := Resolve(catalog, profiles, machine)
@@ -59,6 +73,13 @@ func TestResolveComposesProfilesAndMachineOverlay(t *testing.T) {
 	}
 	if strings.Join(linkIDs, ",") != "base-link,machine-link" {
 		t.Fatalf("resolved links = %v", linkIDs)
+	}
+	var recoveryIDs []string
+	for _, item := range got.Recoveries {
+		recoveryIDs = append(recoveryIDs, item.ID)
+	}
+	if strings.Join(recoveryIDs, ",") != "base-recovery,machine-recovery" {
+		t.Fatalf("resolved recoveries = %v", recoveryIDs)
 	}
 }
 

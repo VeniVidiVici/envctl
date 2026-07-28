@@ -30,6 +30,7 @@ import (
 	"github.com/VeniVidiVici/envctl/internal/onboardui"
 	"github.com/VeniVidiVici/envctl/internal/planner"
 	"github.com/VeniVidiVici/envctl/internal/portablelink"
+	"github.com/VeniVidiVici/envctl/internal/recovery"
 	"github.com/VeniVidiVici/envctl/internal/remoteexec"
 	"github.com/VeniVidiVici/envctl/internal/runtimepath"
 	"github.com/VeniVidiVici/envctl/internal/stateboundary"
@@ -47,6 +48,7 @@ Usage:
   envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
   envctl apply --config DIR --machine ID [--local] [--manager brew|bun|mas] --json (--dry-run | --yes)
   envctl links apply --config DIR --machine ID --local --json (--dry-run | --yes)
+  envctl recovery plan --config DIR --machine ID --local --json
   envctl history --json [--state PATH] [--limit N]
   envctl tui --config DIR --inventory-dir DIR [--state PATH]
   envctl fleet refresh --config DIR --inventory-dir DIR --json
@@ -83,6 +85,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runApply(ctx, args[1:], stdout, stderr)
 	case "links":
 		return runLinks(ctx, args[1:], stdout, stderr)
+	case "recovery":
+		return runRecovery(ctx, args[1:], stdout, stderr)
 	case "config":
 		return runConfig(args[1:], stdout, stderr)
 	case "history":
@@ -152,6 +156,18 @@ func runOnboard(
 			inventory,
 		)
 		result.Plan = &plan
+		if len(loaded.Desired.Recoveries) > 0 {
+			home, err := os.UserHomeDir()
+			if err != nil {
+				return fmt.Errorf("find home directory: %w", err)
+			}
+			recoveryPlanner, err := recovery.NewPlanner(home)
+			if err != nil {
+				return err
+			}
+			recoveryPlan := recoveryPlanner.Plan(ctx, loaded.Desired.Recoveries)
+			result.RecoveryPlan = &recoveryPlan
+		}
 	}
 	if *asJSON {
 		return encodeJSON(stdout, result)
@@ -159,6 +175,69 @@ func runOnboard(
 	return onboardui.Run(onboardui.New(
 		result, *configRoot, onboardui.FileWriter{},
 	))
+}
+
+type recoveryPlanResponse struct {
+	MachineID    string             `json:"machine_id"`
+	ConfigDigest string             `json:"config_digest"`
+	Plan         model.RecoveryPlan `json:"plan"`
+}
+
+func runRecovery(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	if len(args) == 0 || args[0] != "plan" {
+		return errors.New(
+			"usage: envctl recovery plan --config DIR --machine ID " +
+				"--local --json",
+		)
+	}
+	flags := flag.NewFlagSet("recovery plan", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineID := flags.String("machine", "", "machine id from the native config")
+	localMachine := flags.Bool(
+		"local", false,
+		"require this Mac's registered identity and inspect it locally",
+	)
+	asJSON := flags.Bool("json", false, "print the recovery plan as JSON")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if *configRoot == "" || *machineID == "" {
+		return errors.New("--config and --machine are required")
+	}
+	if !*localMachine {
+		return errors.New("recovery planning currently requires --local")
+	}
+	if !*asJSON {
+		return errors.New("recovery planning currently requires --json")
+	}
+	loaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	if err := forceLocalMachine(ctx, &loaded); err != nil {
+		return err
+	}
+	if len(loaded.Desired.Recoveries) == 0 {
+		return errors.New("machine has no desired recovery items")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("find home directory: %w", err)
+	}
+	recoveryPlanner, err := recovery.NewPlanner(home)
+	if err != nil {
+		return err
+	}
+	return encodeJSON(stdout, recoveryPlanResponse{
+		MachineID:    loaded.Machine.ID,
+		ConfigDigest: loaded.Digest,
+		Plan:         recoveryPlanner.Plan(ctx, loaded.Desired.Recoveries),
+	})
 }
 
 type linkApplyResponse struct {

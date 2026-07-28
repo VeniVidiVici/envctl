@@ -221,6 +221,105 @@ access:
 	}
 }
 
+func TestRecoveryPlanUsesPinnedAgeIdentityAndEmitsNoPlaintext(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("recovery local identity integration requires macOS")
+	}
+	ctx := context.Background()
+	identity, err := onboard.Detect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("SOPS_AGE_KEY", "inherited-value-must-not-be-used")
+	t.Setenv("SOPS_AGE_KEY_FILE", filepath.Join(home, "wrong-identity"))
+	root := filepath.Join(home, "env-config")
+	source := filepath.Join(root, "secrets", "example.sops.env")
+	target := filepath.Join(home, ".config", "example", "env")
+	identityPath := filepath.Join(home, ".config", "sops", "age", "keys.txt")
+	writeMainTestFile(t, source, "encrypted-placeholder")
+	writeMainTestFile(t, target, "private-value")
+	writeMainTestFile(t, identityPath, "age-identity")
+	writeMainTestFile(t, filepath.Join(root, "envctl.yaml"), `
+version: 1
+catalog: catalog/packages.yaml
+profiles: profiles
+machines: machines
+recovery_root: ~/Recovery
+`)
+	writeMainTestFile(t, filepath.Join(root, "catalog", "packages.yaml"), `
+version: 1
+packages:
+  example:
+    manager: manual
+    kind: tool
+    package: example
+    update_policy: external
+recoveries:
+  example:
+    kind: sops-file
+    source: secrets/example.sops.env
+    target: ~/.config/example/env
+    format: dotenv
+    mode: "0600"
+`)
+	writeMainTestFile(t, filepath.Join(root, "profiles", "shared.yaml"), `
+version: 1
+name: shared
+recoveries:
+  - example
+`)
+	writeMainTestFile(
+		t,
+		filepath.Join(root, "machines", "example.yaml"),
+		fmt.Sprintf(`
+version: 1
+id: example
+match:
+  hardware_uuid_sha256: %s
+profiles:
+  - shared
+access:
+  type: local
+`, identity.HardwareUUIDSHA256),
+	)
+	binDirectory := filepath.Join(home, "bin")
+	sops := filepath.Join(binDirectory, "sops")
+	writeMainTestFile(t, sops, `#!/bin/sh
+test -z "${SOPS_AGE_KEY:-}" || exit 10
+test -f "$SOPS_AGE_KEY_FILE" || exit 11
+printf '%s' 'private-value'
+`)
+	if err := os.Chmod(sops, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDirectory+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var stdout, stderr bytes.Buffer
+	err = run(ctx, []string{
+		"recovery", "plan",
+		"--config", root,
+		"--machine", "example",
+		"--local",
+		"--json",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf("recovery plan error = %v\nstderr = %s", err, stderr.String())
+	}
+	var response recoveryPlanResponse
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !response.Plan.Ready || response.Plan.Summary.Satisfied != 1 {
+		t.Fatalf("response = %#v", response)
+	}
+	if strings.Contains(stdout.String(), "private-value") ||
+		strings.Contains(stdout.String(), "age-identity") {
+		t.Fatalf("recovery output exposed plaintext: %s", stdout.String())
+	}
+}
+
 func TestVerifyActionsRequiresSatisfiedFinding(t *testing.T) {
 	actions := []model.Action{{PackageID: "loc"}}
 	if verified, err := verifyActions(actions, model.Plan{

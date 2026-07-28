@@ -17,11 +17,12 @@ import (
 )
 
 type rootFile struct {
-	Version  int    `yaml:"version"`
-	Catalog  string `yaml:"catalog"`
-	Profiles string `yaml:"profiles"`
-	Machines string `yaml:"machines"`
-	State    struct {
+	Version      int    `yaml:"version"`
+	Catalog      string `yaml:"catalog"`
+	Profiles     string `yaml:"profiles"`
+	Machines     string `yaml:"machines"`
+	RecoveryRoot string `yaml:"recovery_root,omitempty"`
+	State        struct {
 		Database string `yaml:"database"`
 	} `yaml:"state,omitempty"`
 }
@@ -318,6 +319,74 @@ func Load(root, machineID string) (Loaded, error) {
 		sourceDigest := sha256.Sum256(raw)
 		desired.Links[index].Digest = hex.EncodeToString(sourceDigest[:])
 	}
+	recoveryRoot := ""
+	if len(catalogFile.Recoveries) > 0 {
+		if rootConfig.RecoveryRoot == "" {
+			return Loaded{}, errors.New(
+				"envctl.yaml must define recovery_root when recoveries are configured",
+			)
+		}
+		recoveryRoot, err = expandHome(rootConfig.RecoveryRoot)
+		if err != nil {
+			return Loaded{}, fmt.Errorf("expand recovery root: %w", err)
+		}
+		if err := validateRecoveryRoot(recoveryRoot); err != nil {
+			return Loaded{}, err
+		}
+	}
+	for index, recovery := range desired.Recoveries {
+		target, err := expandHome(recovery.Target)
+		if err != nil {
+			return Loaded{}, fmt.Errorf(
+				"expand recovery %q target: %w", recovery.ID, err,
+			)
+		}
+		desired.Recoveries[index].Target = target
+		switch recovery.Kind {
+		case model.RecoveryKindSOPSFile:
+			sourcePath, err := safePath(absoluteRoot, recovery.Source)
+			if err != nil {
+				return Loaded{}, fmt.Errorf(
+					"resolve recovery %q source: %w", recovery.ID, err,
+				)
+			}
+			raw, err := os.ReadFile(sourcePath)
+			if err != nil {
+				return Loaded{}, fmt.Errorf(
+					"read recovery %q source: %w", recovery.ID, err,
+				)
+			}
+			relativeSource, err := filepath.Rel(absoluteRoot, sourcePath)
+			if err != nil {
+				return Loaded{}, fmt.Errorf(
+					"name recovery %q source: %w", recovery.ID, err,
+				)
+			}
+			hasher.Write([]byte(filepath.ToSlash(relativeSource)))
+			hasher.Write([]byte{0})
+			hasher.Write(raw)
+			hasher.Write([]byte{0})
+			loadedFiles = append(loadedFiles, filepath.ToSlash(relativeSource))
+			desired.Recoveries[index].Source = sourcePath
+		case model.RecoveryKindAgeArchive:
+			desired.Recoveries[index].Source = filepath.Join(
+				recoveryRoot,
+				recovery.Source,
+			)
+		case model.RecoveryKindGPGKeyring:
+			resolvedSources := make(map[string]string, len(recovery.Sources))
+			for role, source := range recovery.Sources {
+				resolvedSources[role] = filepath.Join(recoveryRoot, source)
+			}
+			desired.Recoveries[index].Sources = resolvedSources
+		default:
+			return Loaded{}, fmt.Errorf(
+				"recovery %q has unsupported kind %q",
+				recovery.ID,
+				recovery.Kind,
+			)
+		}
+	}
 
 	profileNames := make([]string, 0, len(profiles))
 	for name := range profiles {
@@ -422,7 +491,175 @@ func validateCatalog(root string, catalog *Catalog) error {
 		}
 		catalog.Links[id] = item
 	}
+	recoveryTargets := make(map[string]string, len(catalog.Recoveries))
+	for id, item := range catalog.Recoveries {
+		if !safeIdentifier(id) {
+			return fmt.Errorf("catalog recovery has unsafe id %q", id)
+		}
+		if item.ID != "" && item.ID != id {
+			return fmt.Errorf(
+				"catalog recovery %q declares mismatched id %q", id, item.ID,
+			)
+		}
+		item.ID = id
+		if err := validateRecoverySpec(root, item); err != nil {
+			return fmt.Errorf("catalog recovery %q: %w", id, err)
+		}
+		cleanedTarget := filepath.Clean(item.Target)
+		if existing := recoveryTargets[cleanedTarget]; existing != "" {
+			return fmt.Errorf(
+				"catalog recoveries %q and %q share target %q",
+				existing,
+				id,
+				item.Target,
+			)
+		}
+		recoveryTargets[cleanedTarget] = id
+		catalog.Recoveries[id] = item
+	}
 	return nil
+}
+
+func validateRecoverySpec(root string, item model.RecoverySpec) error {
+	if err := validateRecoveryTarget(item.Kind, item.Target); err != nil {
+		return err
+	}
+	switch item.Kind {
+	case model.RecoveryKindSOPSFile:
+		if item.Mode != "0600" {
+			return errors.New("sops-file mode must be quoted 0600")
+		}
+		switch item.Format {
+		case "dotenv", "ini", "yaml", "json":
+		default:
+			return fmt.Errorf("sops-file has unsupported format %q", item.Format)
+		}
+		if len(item.Sources) != 0 || len(item.Members) != 0 ||
+			item.Fingerprint != "" {
+			return errors.New("sops-file has fields for another recovery kind")
+		}
+		sourcePath, err := safePath(root, item.Source)
+		if err != nil {
+			return fmt.Errorf("source: %w", err)
+		}
+		info, err := os.Lstat(sourcePath)
+		if err != nil {
+			return fmt.Errorf("source: %w", err)
+		}
+		if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+			return errors.New("source must be a regular non-symlink file")
+		}
+	case model.RecoveryKindAgeArchive:
+		if item.Mode != "0600" {
+			return errors.New("age-archive member mode must be quoted 0600")
+		}
+		if !safeRecoverySourceName(item.Source) {
+			return errors.New("age-archive source must be a safe recovery filename")
+		}
+		if item.Format != "" || len(item.Sources) != 0 ||
+			item.Fingerprint != "" {
+			return errors.New("age-archive has fields for another recovery kind")
+		}
+		if len(item.Members) == 0 || len(item.Members) > 100 {
+			return errors.New("age-archive must declare between 1 and 100 members")
+		}
+		seen := make(map[string]bool, len(item.Members))
+		for _, member := range item.Members {
+			if !safeRecoverySourceName(member) || seen[member] {
+				return fmt.Errorf("age-archive has unsafe or duplicate member %q", member)
+			}
+			seen[member] = true
+		}
+	case model.RecoveryKindGPGKeyring:
+		if item.Mode != "0700" {
+			return errors.New("gpg-keyring mode must be quoted 0700")
+		}
+		if item.Source != "" || item.Format != "" || len(item.Members) != 0 {
+			return errors.New("gpg-keyring has fields for another recovery kind")
+		}
+		if len(item.Fingerprint) != 40 && len(item.Fingerprint) != 64 {
+			return errors.New("gpg-keyring fingerprint must contain 40 or 64 hex characters")
+		}
+		if _, err := hex.DecodeString(item.Fingerprint); err != nil ||
+			item.Fingerprint != strings.ToUpper(item.Fingerprint) {
+			return errors.New("gpg-keyring fingerprint must be uppercase hexadecimal")
+		}
+		expectedRoles := []string{"ownertrust", "private", "public"}
+		if len(item.Sources) != len(expectedRoles) {
+			return errors.New("gpg-keyring must declare public, private, and ownertrust sources")
+		}
+		for _, role := range expectedRoles {
+			if !safeRecoverySourceName(item.Sources[role]) {
+				return fmt.Errorf(
+					"gpg-keyring %s source must be a safe recovery filename", role,
+				)
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported recovery kind %q", item.Kind)
+	}
+	return nil
+}
+
+func validateRecoveryTarget(kind model.RecoveryKind, target string) error {
+	if !strings.HasPrefix(target, "~/") {
+		return fmt.Errorf(
+			"recovery target must begin with ~/: %q",
+			target,
+		)
+	}
+	cleaned := filepath.Clean(strings.TrimPrefix(target, "~/"))
+	if cleaned == "." || cleaned == ".." ||
+		strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("recovery target escapes or replaces the home directory: %q", target)
+	}
+	switch kind {
+	case model.RecoveryKindAgeArchive:
+		if cleaned != ".ssh" {
+			return errors.New("age-archive recovery target must be ~/.ssh")
+		}
+	case model.RecoveryKindGPGKeyring:
+		if cleaned != ".gnupg" {
+			return errors.New("gpg-keyring recovery target must be ~/.gnupg")
+		}
+	case model.RecoveryKindSOPSFile:
+		if cleaned == ".ssh" || strings.HasPrefix(cleaned, ".ssh/") ||
+			cleaned == ".gnupg" || strings.HasPrefix(cleaned, ".gnupg/") ||
+			cleaned == ".local/state" ||
+			strings.HasPrefix(cleaned, ".local/state/") {
+			return fmt.Errorf("sops-file target enters protected state area %q", cleaned)
+		}
+	}
+	return nil
+}
+
+func validateRecoveryRoot(root string) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("find home directory: %w", err)
+	}
+	relative, err := filepath.Rel(home, root)
+	if err != nil || relative == "." || relative == ".." ||
+		strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return errors.New("recovery_root must be a directory inside the home directory")
+	}
+	return nil
+}
+
+func safeRecoverySourceName(value string) bool {
+	if value == "" || filepath.Base(value) != value || value == "." || value == ".." {
+		return false
+	}
+	for _, character := range value {
+		if (character >= 'a' && character <= 'z') ||
+			(character >= 'A' && character <= 'Z') ||
+			(character >= '0' && character <= '9') ||
+			strings.ContainsRune("._-", character) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func validateLinkTarget(target string) error {

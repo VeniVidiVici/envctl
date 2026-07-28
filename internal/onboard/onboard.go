@@ -36,15 +36,16 @@ const (
 )
 
 type Result struct {
-	Status             Status             `json:"status"`
-	Identity           Identity           `json:"identity"`
-	MachineID          string             `json:"machine_id,omitempty"`
-	SuggestedMachineID string             `json:"suggested_machine_id"`
-	ConfiguredMachines []string           `json:"configured_machines"`
-	AvailableProfiles  []string           `json:"available_profiles"`
-	Proposal           *envconfig.Machine `json:"proposal,omitempty"`
-	ProposalPath       string             `json:"proposal_path,omitempty"`
-	Plan               *model.Plan        `json:"plan,omitempty"`
+	Status             Status              `json:"status"`
+	Identity           Identity            `json:"identity"`
+	MachineID          string              `json:"machine_id,omitempty"`
+	SuggestedMachineID string              `json:"suggested_machine_id"`
+	ConfiguredMachines []string            `json:"configured_machines"`
+	AvailableProfiles  []string            `json:"available_profiles"`
+	Proposal           *envconfig.Machine  `json:"proposal,omitempty"`
+	ProposalPath       string              `json:"proposal_path,omitempty"`
+	Plan               *model.Plan         `json:"plan,omitempty"`
+	RecoveryPlan       *model.RecoveryPlan `json:"recovery_plan,omitempty"`
 }
 
 type hardwareProfile struct {

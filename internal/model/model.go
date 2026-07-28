@@ -66,6 +66,62 @@ type LinkSpec struct {
 	Digest string   `json:"digest,omitempty" yaml:"-"`
 }
 
+type RecoveryKind string
+
+const (
+	RecoveryKindSOPSFile   RecoveryKind = "sops-file"
+	RecoveryKindAgeArchive RecoveryKind = "age-archive"
+	RecoveryKindGPGKeyring RecoveryKind = "gpg-keyring"
+)
+
+type RecoverySpec struct {
+	ID          string            `json:"id" yaml:"id,omitempty"`
+	Kind        RecoveryKind      `json:"kind" yaml:"kind"`
+	Source      string            `json:"source,omitempty" yaml:"source,omitempty"`
+	Sources     map[string]string `json:"sources,omitempty" yaml:"sources,omitempty"`
+	Target      string            `json:"target" yaml:"target"`
+	Format      string            `json:"format,omitempty" yaml:"format,omitempty"`
+	Mode        string            `json:"mode" yaml:"mode"`
+	Members     []string          `json:"members,omitempty" yaml:"members,omitempty"`
+	Fingerprint string            `json:"fingerprint,omitempty" yaml:"fingerprint,omitempty"`
+}
+
+type RecoveryFindingStatus string
+
+const (
+	RecoveryFindingSatisfied     RecoveryFindingStatus = "satisfied"
+	RecoveryFindingMissing       RecoveryFindingStatus = "missing"
+	RecoveryFindingDrifted       RecoveryFindingStatus = "drifted"
+	RecoveryFindingBlocked       RecoveryFindingStatus = "blocked"
+	RecoveryFindingToolMissing   RecoveryFindingStatus = "tool-missing"
+	RecoveryFindingSourceMissing RecoveryFindingStatus = "source-missing"
+	RecoveryFindingSourceUnsafe  RecoveryFindingStatus = "source-unsafe"
+)
+
+type RecoveryFinding struct {
+	Status     RecoveryFindingStatus `json:"status"`
+	RecoveryID string                `json:"recovery_id"`
+	Kind       RecoveryKind          `json:"kind"`
+	Target     string                `json:"target"`
+	Detail     string                `json:"detail"`
+}
+
+type RecoveryPlanSummary struct {
+	Satisfied     int `json:"satisfied"`
+	Missing       int `json:"missing"`
+	Drifted       int `json:"drifted"`
+	Blocked       int `json:"blocked"`
+	ToolMissing   int `json:"tool_missing"`
+	SourceMissing int `json:"source_missing"`
+	SourceUnsafe  int `json:"source_unsafe"`
+}
+
+type RecoveryPlan struct {
+	Summary  RecoveryPlanSummary `json:"summary"`
+	Findings []RecoveryFinding   `json:"findings"`
+	Ready    bool                `json:"ready"`
+}
+
 type LinkObservation struct {
 	ID             string `json:"id"`
 	Source         string `json:"source"`
