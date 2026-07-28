@@ -26,9 +26,12 @@ import (
 	"github.com/VeniVidiVici/envctl/internal/legacy"
 	"github.com/VeniVidiVici/envctl/internal/mas"
 	"github.com/VeniVidiVici/envctl/internal/model"
+	"github.com/VeniVidiVici/envctl/internal/onboard"
+	"github.com/VeniVidiVici/envctl/internal/onboardui"
 	"github.com/VeniVidiVici/envctl/internal/planner"
 	"github.com/VeniVidiVici/envctl/internal/portablelink"
 	"github.com/VeniVidiVici/envctl/internal/remoteexec"
+	"github.com/VeniVidiVici/envctl/internal/runtimepath"
 	"github.com/VeniVidiVici/envctl/internal/stateboundary"
 	"github.com/VeniVidiVici/envctl/internal/store"
 )
@@ -37,11 +40,12 @@ const usage = `envctl is a read-first macOS environment manager.
 
 Usage:
   envctl audit --json [--state PATH] [--no-record]
+  envctl onboard --config DIR [--json] [--machine ID] [--profiles A,B]
   envctl import-legacy --input PATH
   envctl config validate --config DIR --json
   envctl config resolve --config DIR --machine ID --json
   envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
-  envctl apply --config DIR --machine ID [--manager brew|bun|mas] --json (--dry-run | --yes)
+  envctl apply --config DIR --machine ID [--local] [--manager brew|bun|mas] --json (--dry-run | --yes)
   envctl history --json [--state PATH] [--limit N]
   envctl tui --config DIR --inventory-dir DIR [--state PATH]
   envctl fleet refresh --config DIR --inventory-dir DIR --json
@@ -49,6 +53,10 @@ Usage:
 `
 
 func main() {
+	if err := runtimepath.Apply(); err != nil {
+		fmt.Fprintf(os.Stderr, "envctl: %v\n", err)
+		os.Exit(1)
+	}
 	if err := run(context.Background(), os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintf(os.Stderr, "envctl: %v\n", err)
 		os.Exit(1)
@@ -64,6 +72,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	switch args[0] {
 	case "audit":
 		return runAudit(ctx, args[1:], stdout, stderr)
+	case "onboard":
+		return runOnboard(ctx, args[1:], stdout, stderr)
 	case "import-legacy":
 		return runImportLegacy(args[1:], stdout, stderr)
 	case "plan":
@@ -84,6 +94,68 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
+}
+
+func runOnboard(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("onboard", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineID := flags.String("machine", "", "proposed machine id")
+	profileSelection := flags.String(
+		"profiles", "", "comma-separated profiles for a new machine",
+	)
+	asJSON := flags.Bool("json", false, "print the onboarding result as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" {
+		return errors.New("--config is required")
+	}
+	machines, err := envconfig.Machines(*configRoot)
+	if err != nil {
+		return err
+	}
+	profiles, err := envconfig.ProfileNames(*configRoot)
+	if err != nil {
+		return err
+	}
+	identity, err := onboard.Detect(ctx)
+	if err != nil {
+		return err
+	}
+	result, err := onboard.Resolve(
+		identity,
+		machines,
+		profiles,
+		*machineID,
+		splitCommaSeparated(*profileSelection),
+	)
+	if err != nil {
+		return err
+	}
+	if result.Status == onboard.StatusMatched {
+		loaded, err := envconfig.Load(*configRoot, result.MachineID)
+		if err != nil {
+			return err
+		}
+		inventory := collectInventory(ctx, loaded.Desired.Links)
+		plan := planInventory(
+			loaded.Desired.Packages,
+			loaded.Desired.Links,
+			inventory,
+		)
+		result.Plan = &plan
+	}
+	if *asJSON {
+		return encodeJSON(stdout, result)
+	}
+	return onboardui.Run(onboardui.New(
+		result, *configRoot, onboardui.FileWriter{},
+	))
 }
 
 type applyResponse struct {
@@ -122,6 +194,10 @@ func runApply(
 	managerName := flags.String(
 		"manager", "", "limit apply to one supported manager: brew, bun, or mas",
 	)
+	localMachine := flags.Bool(
+		"local", false,
+		"require this Mac's registered identity and execute locally",
+	)
 	statePath := flags.String("state", "", "SQLite state database path")
 	dryRun := flags.Bool("dry-run", false, "validate and print commands without changing state")
 	yes := flags.Bool("yes", false, "confirm execution of the validated plan")
@@ -151,6 +227,11 @@ func runApply(
 	loaded, err := envconfig.Load(*configRoot, *machineID)
 	if err != nil {
 		return err
+	}
+	if *localMachine {
+		if err := forceLocalMachine(ctx, &loaded); err != nil {
+			return err
+		}
 	}
 	beforeInventory, err := collectMachineInventory(ctx, loaded)
 	if err != nil {
@@ -240,6 +321,11 @@ func runApply(
 	reloaded, err := envconfig.Load(*configRoot, *machineID)
 	if err != nil {
 		return fmt.Errorf("reload configuration before apply: %w", err)
+	}
+	if *localMachine {
+		if err := forceLocalMachine(ctx, &reloaded); err != nil {
+			return err
+		}
 	}
 	if reloaded.Digest != loaded.Digest {
 		return errors.New("configuration changed during planning; rerun apply")
@@ -439,6 +525,22 @@ func executionRunnerFor(loaded envconfig.Loaded) (executor.Runner, error) {
 			loaded.Machine.Access.Type,
 		)
 	}
+}
+
+func forceLocalMachine(
+	ctx context.Context,
+	loaded *envconfig.Loaded,
+) error {
+	identity, err := onboard.Detect(ctx)
+	if err != nil {
+		return fmt.Errorf("verify local machine identity: %w", err)
+	}
+	machine, err := onboard.AsLocal(loaded.Machine, identity)
+	if err != nil {
+		return err
+	}
+	loaded.Machine = machine
+	return nil
 }
 
 func collectMachineInventory(
@@ -1404,6 +1506,19 @@ func selectMachineIDs(available []string, selection string) ([]string, error) {
 		return nil, errors.New("--machines selected no machines")
 	}
 	return selected, nil
+}
+
+func splitCommaSeparated(value string) []string {
+	var result []string
+	seen := make(map[string]bool)
+	for _, item := range strings.Split(value, ",") {
+		item = strings.TrimSpace(item)
+		if item != "" && !seen[item] {
+			result = append(result, item)
+			seen[item] = true
+		}
+	}
+	return result
 }
 
 func loadInventory(path string) (model.Inventory, error) {

@@ -29,12 +29,31 @@ Validate a native configuration without collecting or changing machine state:
 envctl config validate --config /path/to/env-config --json
 ```
 
+Identify and register a Mac interactively:
+
+```sh
+envctl onboard --config /path/to/env-config
+```
+
+Onboarding hashes the platform UUID before it leaves the local identity
+collector. It can add that fingerprint to a clean existing machine file or
+create a proposed machine overlay, but only after an explicit two-key
+confirmation. It does not commit, push, install packages, or apply links.
+Use `--json` for a read-only, scriptable result.
+
+Once the identity is registered, onboarding includes a live local plan and
+prints the matching `apply --local --dry-run` command. `--local` is accepted
+only when the current Mac's hardware fingerprint matches the requested machine;
+it cannot be used to bypass machine selection.
+
 For a clean Mac, `scripts/bootstrap-macos` is the versioned bootstrap
 foundation. It expects the age identity and encrypted read-only `env-config`
 deploy key in iCloud's `Env Secrets` directory. It installs only the tools
 needed to clone both repositories and build envctl, verifies the encrypted
 config, and records an initial read-only audit. Desired-state onboarding and
-link application are intentionally not part of this script yet.
+link application are intentionally not automatic. In an interactive terminal,
+the script continues into the onboarding TUI; otherwise it prints the exact
+command to run later.
 
 Then launch the fleet review TUI with:
 

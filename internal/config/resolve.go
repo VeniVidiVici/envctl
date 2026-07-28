@@ -21,12 +21,17 @@ type Profile struct {
 
 type Machine struct {
 	ID          string   `json:"id" yaml:"id"`
+	Match       Match    `json:"match,omitempty" yaml:"match,omitempty"`
 	Profiles    []string `json:"profiles" yaml:"profiles"`
 	Add         []string `json:"add,omitempty" yaml:"add,omitempty"`
 	Remove      []string `json:"remove,omitempty" yaml:"remove,omitempty"`
 	AddLinks    []string `json:"add_links,omitempty" yaml:"add_links,omitempty"`
 	RemoveLinks []string `json:"remove_links,omitempty" yaml:"remove_links,omitempty"`
 	Access      Access   `json:"access" yaml:"access"`
+}
+
+type Match struct {
+	HardwareUUIDSHA256 string `json:"hardware_uuid_sha256,omitempty" yaml:"hardware_uuid_sha256,omitempty"`
 }
 
 type Access struct {
