@@ -25,16 +25,17 @@ const (
 )
 
 type LinkAction struct {
-	Sequence           int        `json:"sequence"`
-	LinkID             string     `json:"link_id"`
-	Type               ActionType `json:"type"`
-	Source             string     `json:"source"`
-	Target             string     `json:"target"`
-	LinkValue          string     `json:"link_value"`
-	ExpectedDigest     string     `json:"expected_digest"`
-	ExpectedTargetType string     `json:"expected_target_type"`
-	ExpectedLinkTarget string     `json:"expected_link_target,omitempty"`
-	BackupPath         string     `json:"backup_path,omitempty"`
+	Sequence           int            `json:"sequence"`
+	LinkID             string         `json:"link_id"`
+	Type               ActionType     `json:"type"`
+	Source             string         `json:"source"`
+	Target             string         `json:"target"`
+	LinkValue          string         `json:"link_value"`
+	ExpectedDigest     string         `json:"expected_digest"`
+	Kind               model.LinkKind `json:"kind"`
+	ExpectedTargetType string         `json:"expected_target_type"`
+	ExpectedLinkTarget string         `json:"expected_link_target,omitempty"`
+	BackupPath         string         `json:"backup_path,omitempty"`
 }
 
 type LinkBlocker struct {
@@ -138,7 +139,7 @@ func (t *Transaction) Plan(specs []model.LinkSpec) (TransactionPlan, error) {
 			action := LinkAction{
 				Sequence: len(plan.Actions) + 1,
 				LinkID:   spec.ID, Source: spec.Source, Target: spec.Target,
-				LinkValue: linkValue, ExpectedDigest: spec.Digest,
+				LinkValue: linkValue, ExpectedDigest: spec.Digest, Kind: spec.Kind,
 			}
 			if finding.Observed != nil {
 				action.ExpectedTargetType = finding.Observed.TargetType
@@ -326,7 +327,8 @@ func (t *Transaction) validatePlan(
 		if !ok ||
 			spec.Source != action.Source ||
 			spec.Target != action.Target ||
-			spec.Digest != action.ExpectedDigest {
+			spec.Digest != action.ExpectedDigest ||
+			spec.Kind != action.Kind {
 			return fmt.Errorf(
 				"portable-link action %q does not match desired state",
 				action.LinkID,
@@ -399,8 +401,11 @@ func (t *Transaction) validatePlan(
 }
 
 func (t *Transaction) validatePaths(spec model.LinkSpec) error {
-	if spec.Kind != model.LinkKindFile {
-		return fmt.Errorf("link %q is not a portable file link", spec.ID)
+	if spec.Kind != model.LinkKindFile &&
+		spec.Kind != model.LinkKindDirectory {
+		return fmt.Errorf(
+			"link %q has unsupported portable kind %q", spec.ID, spec.Kind,
+		)
 	}
 	if !pathWithin(t.home, spec.Target) || spec.Target == t.home {
 		return fmt.Errorf("link %q target is outside the home directory", spec.ID)
@@ -429,9 +434,13 @@ type appliedOperation struct {
 func validateActionPrecondition(action LinkAction) error {
 	observation := Collect([]model.LinkSpec{{
 		ID: action.LinkID, Source: action.Source, Target: action.Target,
-		Kind: model.LinkKindFile,
+		Kind: action.Kind,
 	}})[0]
-	if observation.SourceType != "file" ||
+	expectedSourceType := "file"
+	if action.Kind == model.LinkKindDirectory {
+		expectedSourceType = "directory"
+	}
+	if observation.SourceType != expectedSourceType ||
 		observation.SourceDigest != action.ExpectedDigest {
 		return fmt.Errorf(
 			"link %q source changed after planning",

@@ -66,6 +66,26 @@ func TestBuildClassifiesHomebrewState(t *testing.T) {
 	}
 }
 
+func TestBuildPlansConfiguredMiseVersionDrift(t *testing.T) {
+	desired := []model.PackageSpec{{
+		ID: "node-runtime", Manager: model.ManagerMise,
+		Kind: model.KindTool, Package: "node", Version: "24",
+		UpdatePolicy: model.UpdateManaged,
+	}}
+	installed := []model.InstalledPackage{{
+		Manager: model.ManagerMise, Kind: model.KindTool,
+		Package: "node", Version: "22",
+	}}
+	plan := Build(desired, installed, []model.Manager{model.ManagerMise})
+	if len(plan.Findings) != 1 ||
+		plan.Findings[0].Status != model.FindingVersionDrift ||
+		len(plan.Actions) != 1 ||
+		plan.Actions[0].Type != model.ActionInstall ||
+		plan.Actions[0].Version != "24" {
+		t.Fatalf("plan = %#v", plan)
+	}
+}
+
 func TestBuildRequiresReviewForUnresolvedMissingPackage(t *testing.T) {
 	desired := []model.PackageSpec{{
 		ID: "unknown", Manager: model.ManagerBrew, Kind: model.KindUnknown,

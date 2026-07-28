@@ -11,8 +11,8 @@ to provide:
 - local SQLite history without putting machine state in Git.
 
 Its package apply slice is intentionally narrow: it can install missing
-Homebrew formulae and casks plus declared Bun global tools on config-declared
-local and SSH machines.
+Homebrew formulae and casks, declared Mise runtimes, and declared Bun global
+tools on config-declared local and SSH machines.
 
 Build the committed checkout into the user-local PATH:
 
@@ -41,11 +41,26 @@ confirmation. It does not commit, push, install packages, or apply links.
 Use `--json` for a read-only, scriptable result.
 
 Once the identity is registered, onboarding includes a live local plan and
-prints the matching `apply --local --dry-run` command. `--local` is accepted
+hands off to the guided setup TUI. `--local` is accepted
 only when the current Mac's hardware fingerprint matches the requested machine;
 it cannot be used to bypass machine selection.
 
-Portable links have a separately scoped transaction:
+Run or resume first-run convergence with:
+
+```sh
+envctl setup \
+  --config /path/to/env-config \
+  --machine example-mac \
+  --local
+```
+
+Setup presents credential recovery, portable links, Homebrew, Mise, Bun, Mac
+App Store review, and manual tools as ordered phases. Each executable phase
+launches the existing scoped envctl transaction in a child process, so it
+replans against live state, asks for confirmation, journals mutations, and
+verifies the result. `--json` prints the same phase plan without changing state.
+
+Portable links also have a separately scoped transaction:
 
 ```sh
 envctl links apply \
@@ -96,10 +111,10 @@ For a clean Mac, `scripts/bootstrap-macos` is the versioned bootstrap
 foundation. It expects the age identity and encrypted read-only `env-config`
 deploy key in iCloud's `Env Secrets` directory. It installs only the tools
 needed to clone both repositories and build envctl, verifies the encrypted
-config, and records an initial read-only audit. Desired-state onboarding and
-link application are intentionally not automatic. In an interactive terminal,
-the script continues into the onboarding TUI; otherwise it prints the exact
-command to run later.
+config, and records an initial read-only audit. Desired-state convergence is
+intentionally not automatic. In an interactive terminal, the script continues
+into onboarding and then points to the setup TUI; otherwise it prints the exact
+onboarding command to run later.
 
 Then launch the fleet review TUI with:
 
@@ -113,6 +128,8 @@ envctl tui \
 
 ```sh
 go run ./cmd/envctl audit --json
+go run ./cmd/envctl setup \
+  --config ../env-config --machine example-mac --local
 go run ./cmd/envctl import-legacy --input ../env/apps-config.json
 go run ./cmd/envctl plan --legacy ../env/apps-config.json --json
 go run ./cmd/envctl apply \
@@ -125,6 +142,8 @@ go run ./cmd/envctl apply \
   --config ../env-config --machine laptop --yes --json
 go run ./cmd/envctl apply \
   --config ../env-config --machine remote-mac --manager bun --yes --json
+go run ./cmd/envctl apply \
+  --config ../env-config --machine remote-mac --manager mise --yes --json
 go run ./cmd/envctl apply \
   --config ../env-config --machine remote-mac --manager mas --dry-run --json
 go run ./cmd/envctl links apply \
@@ -149,9 +168,10 @@ go run ./cmd/envctl fleet export-decisions \
 go test ./...
 ```
 
-`audit` currently collects installed Homebrew formulae and casks, Mac App Store
-applications, Bun global packages, and the declared custom tools Claude,
-gh-dash, and OpenCode. Custom tools use fixed version-only probes with
+`audit` currently collects installed Homebrew formulae and casks, active Mise
+runtimes and their configured version requests, Mac App Store applications,
+Bun global packages, and the declared custom tools Claude, gh-dash, and
+OpenCode. Custom tools use fixed version-only probes with
 five-second timeouts; arbitrary probe commands are never loaded from
 configuration. A failing custom probe becomes a per-tool issue and missing
 finding without hiding healthy custom tools. Package-manager collector failures
@@ -162,8 +182,9 @@ The path may be absent on a machine where OpenCode has not created state yet.
 Boundary violations are named inventory diagnostics; envctl does not repair
 them automatically.
 
-Native profiles can also declare portable file links. Each catalog entry names
-a regular source file inside the config checkout and a home-relative target.
+Native profiles can also declare portable file or directory links. Each
+catalog entry names a real source inside the config checkout and a
+home-relative target. Directory trees reject symlinks and special files.
 Source content is included in the configuration digest. Agentless audits hash
 the source on each machine and inspect the target without following it; plans
 distinguish missing targets, occupied targets, wrong symlinks, missing sources,
@@ -180,17 +201,19 @@ Use `--inventory PATH` to plan centrally from a saved remote audit.
 
 `apply` always creates a new live inventory. `--dry-run` supports both local and
 SSH machines, validates and prints the exact argv for supported low-risk
-Homebrew and Bun global installs, and reports every unsupported action as a
+Homebrew, Mise, and Bun installs, and reports every unsupported action as a
 blocker. Remote dry-runs use the same agentless temporary-binary transport as
 fleet refresh and do not open the state database. `--yes` explicitly authorizes
 execution on a config-declared local or SSH machine and refuses the entire plan
 if any selected action falls outside the supported subset.
 
-`--manager brew`, `--manager bun`, or `--manager mas` explicitly limits an
-apply transaction.
+`--manager brew`, `--manager mise`, `--manager bun`, or `--manager mas`
+explicitly limits an apply transaction.
 Actions for other managers remain visible as deferred actions and are not
 written into that run's executable plan. Bun execution accepts only
 `bun add --global --ignore-scripts --no-progress --no-summary PACKAGE`.
+Mise execution accepts only `mise install --yes TOOL@VERSION` for a declared
+tool and validated version request.
 
 MAS is preflight-only. `--manager mas --dry-run` performs read-only storefront
 lookups on the target and reports mas version, storefront, macOS compatibility,
@@ -201,11 +224,12 @@ Touch ID, Apple Account, purchase, or App Store GUI prompts.
 
 The executor fails fast, journals every action locally in SQLite, performs a
 fresh inventory on the target, and only marks the run complete when each
-applied package has reached its declared type and source. Remote commands use
-strict, noninteractive, independent SSH connections and accept only the exact
-validated package-manager argv. Upgrades, removals, source repair, Mac App Store
-installation, Bun updates/removals, custom tools, and privileged actions are
-not supported by this slice.
+applied package has reached its declared type, source, and configured Mise
+version request. Remote commands use strict, noninteractive, independent SSH
+connections and accept only the exact validated package-manager argv.
+Homebrew upgrades, removals, source repair, Mac App Store installation, Bun
+updates/removals, custom tools, and privileged actions are not supported by
+this slice.
 
 Audits and plans are recorded in `~/.local/state/envctl/state.db` by default.
 Use `--no-record` for an entirely ephemeral run or `--state PATH` to select a

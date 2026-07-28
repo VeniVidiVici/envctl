@@ -132,6 +132,15 @@ func match(wanted model.PackageSpec, installed []model.InstalledPackage) (model.
 	}
 
 	actual := installed[filtered[0]]
+	if wanted.Version != "" && actual.Version != wanted.Version {
+		base.Status = model.FindingVersionDrift
+		base.Installed = []model.InstalledPackage{actual}
+		base.Detail = fmt.Sprintf(
+			"installed version request %q instead of %q",
+			actual.Version, wanted.Version,
+		)
+		return base, candidates
+	}
 	resolved := wanted
 	resolved.Kind = actual.Kind
 	resolved.Source = actual.Source
@@ -161,6 +170,7 @@ func actionFor(finding model.Finding) (model.Action, bool) {
 		Kind:      wanted.Kind,
 		Source:    wanted.Source,
 		Package:   wanted.Package,
+		Version:   wanted.Version,
 	}
 
 	switch finding.Status {
@@ -182,6 +192,12 @@ func actionFor(finding model.Finding) (model.Action, bool) {
 		action.Risk = model.RiskMedium
 		action.RequiresReview = true
 		action.Reason = "replace the installed package with the configured source"
+		return action, true
+	case model.FindingVersionDrift:
+		action.Type = model.ActionInstall
+		action.Risk = model.RiskLow
+		action.Reversible = true
+		action.Reason = "install the configured version request"
 		return action, true
 	case model.FindingKindDrift, model.FindingAmbiguous:
 		action.Type = model.ActionReview
@@ -218,7 +234,7 @@ func packagesAt(packages []model.InstalledPackage, indices []int) []model.Instal
 
 func isUserManaged(item model.InstalledPackage) bool {
 	switch item.Manager {
-	case model.ManagerMAS, model.ManagerBun:
+	case model.ManagerMAS, model.ManagerMise, model.ManagerBun:
 		return true
 	case model.ManagerBrew:
 		if item.Kind == model.KindCask {
@@ -267,7 +283,8 @@ func updateSummary(summary *model.PlanSummary, status model.FindingStatus) {
 		summary.Satisfied++
 	case model.FindingMissing:
 		summary.Missing++
-	case model.FindingSourceDrift, model.FindingKindDrift:
+	case model.FindingSourceDrift, model.FindingKindDrift,
+		model.FindingVersionDrift:
 		summary.Drifted++
 	case model.FindingAmbiguous:
 		summary.Ambiguous++

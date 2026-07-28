@@ -78,6 +78,58 @@ func TestPlanBuildsExactBunGlobalCommand(t *testing.T) {
 	}
 }
 
+func TestPlanBuildsExactMiseRuntimeCommand(t *testing.T) {
+	action := model.Action{
+		Sequence: 1, Type: model.ActionInstall, PackageID: "node-runtime",
+		Manager: model.ManagerMise, Kind: model.KindTool,
+		Package: "node", Version: "24", Risk: model.RiskLow,
+		Reversible: true,
+	}
+	commands, err := New(nil, nil).Plan([]model.Action{action})
+	if err != nil {
+		t.Fatalf("Plan() error = %v", err)
+	}
+	want := []string{"install", "--yes", "node@24"}
+	if len(commands) != 1 || commands[0].Name != "mise" ||
+		!reflect.DeepEqual(commands[0].Args, want) {
+		t.Fatalf("commands = %#v, want args %#v", commands, want)
+	}
+}
+
+func TestPlanRejectsUnsafeMiseActions(t *testing.T) {
+	base := model.Action{
+		Sequence: 1, Type: model.ActionInstall, PackageID: "node-runtime",
+		Manager: model.ManagerMise, Kind: model.KindTool,
+		Package: "node", Version: "24", Risk: model.RiskLow,
+	}
+	tests := []struct {
+		name   string
+		mutate func(*model.Action)
+	}{
+		{"wrong kind", func(action *model.Action) {
+			action.Kind = model.KindFormula
+		}},
+		{"source", func(action *model.Action) {
+			action.Source = "registry"
+		}},
+		{"unsafe tool", func(action *model.Action) {
+			action.Package = "--jobs"
+		}},
+		{"unsafe version", func(action *model.Action) {
+			action.Version = "24;uname"
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			action := base
+			test.mutate(&action)
+			if _, err := New(nil, nil).Plan([]model.Action{action}); err == nil {
+				t.Fatal("Plan() error = nil, want rejection")
+			}
+		})
+	}
+}
+
 func TestPlanRejectsUnsafeBunActions(t *testing.T) {
 	base := model.Action{
 		Sequence: 1, Type: model.ActionInstall, PackageID: "example",

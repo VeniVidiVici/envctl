@@ -15,6 +15,7 @@ import (
 	"github.com/VeniVidiVici/envctl/internal/model"
 	"github.com/VeniVidiVici/envctl/internal/onboard"
 	"github.com/VeniVidiVici/envctl/internal/portablelink"
+	"github.com/VeniVidiVici/envctl/internal/setupui"
 )
 
 func TestHelp(t *testing.T) {
@@ -32,6 +33,122 @@ func TestUnknownCommand(t *testing.T) {
 	err := run(context.Background(), []string{"unknown"}, &stdout, &stderr)
 	if err == nil {
 		t.Fatal("run(unknown) error = nil, want error")
+	}
+}
+
+func TestLocalSetupCommandBuildsScopedVerifiedApply(t *testing.T) {
+	got := localSetupCommand(
+		"apply", "", "/config", "machine", model.ManagerMise, true,
+	)
+	want := []string{
+		"apply",
+		"--config", "/config",
+		"--machine", "machine",
+		"--local",
+		"--manager", "mise",
+		"--yes",
+		"--json",
+	}
+	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
+		t.Fatalf("command = %#v, want %#v", got, want)
+	}
+}
+
+func TestSetupJSONPlansPhasesWithoutCreatingState(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("setup local identity integration requires macOS")
+	}
+	ctx := context.Background()
+	identity, err := onboard.Detect(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(home, "env-config")
+	statePath := filepath.Join(home, ".local", "state", "envctl", "state.db")
+	writeMainTestFile(t, filepath.Join(root, "envctl.yaml"), fmt.Sprintf(`
+version: 1
+catalog: catalog/packages.yaml
+profiles: profiles
+machines: machines
+state:
+  database: %s
+`, statePath))
+	writeMainTestFile(t, filepath.Join(root, "catalog", "packages.yaml"), `
+version: 1
+packages:
+  example:
+    manager: manual
+    kind: tool
+    package: example
+    update_policy: external
+links:
+  mise-config:
+    source: portable/mise
+    target: ~/.config/mise
+    kind: directory
+`)
+	writeMainTestFile(t, filepath.Join(root, "profiles", "shared.yaml"), `
+version: 1
+name: shared
+packages:
+  - example
+links:
+  - mise-config
+`)
+	writeMainTestFile(
+		t,
+		filepath.Join(root, "machines", "example.yaml"),
+		fmt.Sprintf(`
+version: 1
+id: example
+match:
+  hardware_uuid_sha256: %s
+profiles:
+  - shared
+access:
+  type: local
+`, identity.HardwareUUIDSHA256),
+	)
+	writeMainTestFile(
+		t,
+		filepath.Join(root, "portable", "mise", "config.toml"),
+		"[tools]\n",
+	)
+
+	var stdout, stderr bytes.Buffer
+	err = run(ctx, []string{
+		"setup",
+		"--config", root,
+		"--machine", "example",
+		"--local",
+		"--json",
+	}, &stdout, &stderr)
+	if err != nil {
+		t.Fatalf(
+			"setup error = %v\nstdout = %s\nstderr = %s",
+			err, stdout.String(), stderr.String(),
+		)
+	}
+	var response setupResponse
+	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Phases) != 7 {
+		t.Fatalf("phases = %#v", response.Phases)
+	}
+	var links setupui.Phase
+	for _, phase := range response.Phases {
+		if phase.ID == setupui.PhaseLinks {
+			links = phase
+		}
+	}
+	if links.Status != setupui.StatusReady || links.Actions != 1 {
+		t.Fatalf("link phase = %#v", links)
+	}
+	if _, err := os.Lstat(statePath); !os.IsNotExist(err) {
+		t.Fatalf("setup JSON created state: %v", err)
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/VeniVidiVici/envctl/internal/contentdigest"
 	"github.com/VeniVidiVici/envctl/internal/model"
 	"go.yaml.in/yaml/v3"
 )
@@ -297,17 +298,17 @@ func Load(root, machineID string) (Loaded, error) {
 		if err != nil {
 			return Loaded{}, fmt.Errorf("resolve link %q source: %w", link.ID, err)
 		}
-		raw, err := os.ReadFile(sourcePath)
-		if err != nil {
-			return Loaded{}, fmt.Errorf("read link %q source: %w", link.ID, err)
-		}
 		relativeSource, err := filepath.Rel(absoluteRoot, sourcePath)
 		if err != nil {
 			return Loaded{}, fmt.Errorf("name link %q source: %w", link.ID, err)
 		}
+		sourceDigest, err := digestLinkSource(sourcePath, link.Kind)
+		if err != nil {
+			return Loaded{}, fmt.Errorf("digest link %q source: %w", link.ID, err)
+		}
 		hasher.Write([]byte(filepath.ToSlash(relativeSource)))
 		hasher.Write([]byte{0})
-		hasher.Write(raw)
+		hasher.Write([]byte(sourceDigest))
 		hasher.Write([]byte{0})
 		loadedFiles = append(loadedFiles, filepath.ToSlash(relativeSource))
 		targetPath, err := expandHome(link.Target)
@@ -316,8 +317,7 @@ func Load(root, machineID string) (Loaded, error) {
 		}
 		desired.Links[index].Source = sourcePath
 		desired.Links[index].Target = targetPath
-		sourceDigest := sha256.Sum256(raw)
-		desired.Links[index].Digest = hex.EncodeToString(sourceDigest[:])
+		desired.Links[index].Digest = sourceDigest
 	}
 	recoveryRoot := ""
 	if len(catalogFile.Recoveries) > 0 {
@@ -462,6 +462,18 @@ func validateCatalog(root string, catalog *Catalog) error {
 				return fmt.Errorf("catalog Homebrew package %q must declare its source", id)
 			}
 		}
+		if item.Manager == model.ManagerMise {
+			if item.Kind != model.KindTool {
+				return fmt.Errorf(
+					"catalog Mise package %q must declare tool kind", id,
+				)
+			}
+			if item.Source != "" || item.Version == "" {
+				return fmt.Errorf(
+					"catalog Mise package %q must declare a version and no source", id,
+				)
+			}
+		}
 		catalog.Packages[id] = item
 	}
 	for id, item := range catalog.Links {
@@ -472,8 +484,11 @@ func validateCatalog(root string, catalog *Catalog) error {
 			return fmt.Errorf("catalog link %q declares mismatched id %q", id, item.ID)
 		}
 		item.ID = id
-		if item.Kind != model.LinkKindFile {
-			return fmt.Errorf("catalog link %q must declare file kind", id)
+		if item.Kind != model.LinkKindFile &&
+			item.Kind != model.LinkKindDirectory {
+			return fmt.Errorf(
+				"catalog link %q must declare file or directory kind", id,
+			)
 		}
 		sourcePath, err := safePath(root, item.Source)
 		if err != nil {
@@ -483,8 +498,19 @@ func validateCatalog(root string, catalog *Catalog) error {
 		if err != nil {
 			return fmt.Errorf("catalog link %q source: %w", id, err)
 		}
-		if !info.Mode().IsRegular() {
-			return fmt.Errorf("catalog link %q source is not a regular file", id)
+		switch item.Kind {
+		case model.LinkKindFile:
+			if !info.Mode().IsRegular() {
+				return fmt.Errorf(
+					"catalog link %q source is not a regular file", id,
+				)
+			}
+		case model.LinkKindDirectory:
+			if !info.IsDir() {
+				return fmt.Errorf(
+					"catalog link %q source is not a directory", id,
+				)
+			}
 		}
 		if err := validateLinkTarget(item.Target); err != nil {
 			return fmt.Errorf("catalog link %q target: %w", id, err)
@@ -518,6 +544,17 @@ func validateCatalog(root string, catalog *Catalog) error {
 		catalog.Recoveries[id] = item
 	}
 	return nil
+}
+
+func digestLinkSource(path string, kind model.LinkKind) (string, error) {
+	switch kind {
+	case model.LinkKindFile:
+		return contentdigest.File(path)
+	case model.LinkKindDirectory:
+		return contentdigest.Directory(path)
+	default:
+		return "", fmt.Errorf("unsupported portable link kind %q", kind)
+	}
 }
 
 func validateRecoverySpec(root string, item model.RecoverySpec) error {

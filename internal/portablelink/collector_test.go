@@ -58,3 +58,36 @@ func TestCollectReportsAbsentAndOccupiedTargets(t *testing.T) {
 		t.Fatalf("observations = %#v", got)
 	}
 }
+
+func TestCollectDescribesPortableDirectory(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "repo", "mise")
+	target := filepath.Join(root, "home", ".config", "mise")
+	if err := os.MkdirAll(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(source, "config.toml"), []byte("[tools]\n"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	relative, err := filepath.Rel(filepath.Dir(target), source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(relative, target); err != nil {
+		t.Fatal(err)
+	}
+	got := Collect([]model.LinkSpec{{
+		ID: "mise", Source: source, Target: target,
+		Kind: model.LinkKindDirectory,
+	}})
+	if len(got) != 1 || got[0].SourceType != "directory" ||
+		got[0].SourceDigest == "" || got[0].TargetType != "symlink" ||
+		got[0].ResolvedTarget != source {
+		t.Fatalf("observations = %#v", got)
+	}
+}

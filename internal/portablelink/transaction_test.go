@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/VeniVidiVici/envctl/internal/contentdigest"
 	"github.com/VeniVidiVici/envctl/internal/model"
 )
 
@@ -140,6 +141,61 @@ func TestTransactionBacksUpWrongLinkCreatesMissingAndVerifies(t *testing.T) {
 	}
 	if got, err := os.Readlink(backup); err != nil || got != oldRelative {
 		t.Fatalf("backup target = %q, %v", got, err)
+	}
+}
+
+func TestTransactionReplacesLegacyDirectoryLink(t *testing.T) {
+	home := t.TempDir()
+	source := filepath.Join(home, "env-config", "portable", "mise")
+	legacy := filepath.Join(home, "legacy", "mise")
+	for _, directory := range []string{source, legacy, filepath.Join(home, ".config")} {
+		if err := os.MkdirAll(directory, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(
+		filepath.Join(source, "config.toml"), []byte("[tools]\n"), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(home, ".config", "mise")
+	legacyRelative, err := filepath.Rel(filepath.Dir(target), legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(legacyRelative, target); err != nil {
+		t.Fatal(err)
+	}
+	digest, err := contentdigest.Directory(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec := model.LinkSpec{
+		ID: "mise", Source: source, Target: target,
+		Kind: model.LinkKindDirectory, Digest: digest,
+	}
+	transaction := newTestTransaction(t, home)
+	plan, err := transaction.Plan([]model.LinkSpec{spec})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !plan.Ready || len(plan.Actions) != 1 ||
+		plan.Actions[0].Type != ActionReplace {
+		t.Fatalf("plan = %#v", plan)
+	}
+	result, err := transaction.Apply(
+		context.Background(), plan, []model.LinkSpec{spec}, nil,
+	)
+	if err != nil || !result.Verified {
+		t.Fatalf("result = %#v, error = %v", result, err)
+	}
+	observation := Collect([]model.LinkSpec{spec})[0]
+	if observation.ResolvedTarget != source {
+		t.Fatalf("observation = %#v", observation)
+	}
+	backupInfo, err := os.Lstat(plan.Actions[0].BackupPath)
+	if err != nil || backupInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("backup = %v, %v", backupInfo, err)
 	}
 }
 

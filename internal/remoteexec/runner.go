@@ -20,6 +20,9 @@ var (
 	bunTargetPattern = regexp.MustCompile(
 		`^(?:@[A-Za-z0-9][A-Za-z0-9._-]*/)?[A-Za-z0-9][A-Za-z0-9._-]*$`,
 	)
+	miseTargetPattern = regexp.MustCompile(
+		`^[A-Za-z0-9][A-Za-z0-9+._-]*@[A-Za-z0-9][A-Za-z0-9.+_-]*$`,
+	)
 )
 
 type CommandRunner interface {
@@ -84,6 +87,8 @@ func packageCommand(name string, args []string) (string, error) {
 		return brewCommand(args)
 	case "bun":
 		return bunCommand(args)
+	case "mise":
+		return miseCommand(args)
 	case "mas":
 		return masReadCommand(args)
 	case "sudo":
@@ -91,6 +96,18 @@ func packageCommand(name string, args []string) (string, error) {
 	default:
 		return "", fmt.Errorf("unsupported remote executable %q", name)
 	}
+}
+
+func miseCommand(args []string) (string, error) {
+	if len(args) != 3 ||
+		args[0] != "install" ||
+		args[1] != "--yes" ||
+		!miseTargetPattern.MatchString(args[2]) ||
+		strings.Contains(args[2], "..") {
+		return "", fmt.Errorf("unsupported or unsafe remote Mise argv %q", args)
+	}
+	return "PATH=/opt/homebrew/bin:/usr/local/bin:$PATH " +
+		"mise install --yes " + args[2], nil
 }
 
 func masReadCommand(args []string) (string, error) {
