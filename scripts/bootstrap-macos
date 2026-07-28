@@ -1,0 +1,231 @@
+#!/bin/bash
+
+set -euo pipefail
+
+readonly ENVCTL_PUBLIC_REPO="${ENVCTL_PUBLIC_REPO:-https://github.com/VeniVidiVici/envctl.git}"
+readonly ENVCTL_PUBLIC_REF="${ENVCTL_PUBLIC_REF:-main}"
+readonly ENV_CONFIG_PRIVATE_REPO="${ENV_CONFIG_PRIVATE_REPO:-git@github.com:VeniVidiVici/env-config.git}"
+readonly ENV_CONFIG_PRIVATE_REF="${ENV_CONFIG_PRIVATE_REF:-main}"
+readonly EXPECTED_DEPLOY_FINGERPRINT="SHA256:L1V9JOTYP0AU2x/v0VQeBcBS/1nnoSIJLdQNIb1hC2E"
+readonly GITHUB_ED25519_HOST_KEY="github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
+
+readonly ICLOUD_RECOVERY="$HOME/Library/Mobile Documents/com~apple~CloudDocs/Env Secrets"
+readonly RECOVERY_AGE_IDENTITY="$ICLOUD_RECOVERY/sops-age-keys.txt"
+readonly RECOVERY_DEPLOY_KEY="$ICLOUD_RECOVERY/env-config-deploy-key.age"
+readonly LOCAL_AGE_IDENTITY="$HOME/.config/sops/age/keys.txt"
+readonly LOCAL_DEPLOY_KEY="$HOME/.ssh/env-config-deploy"
+readonly REPOSITORY_ROOT="${ENVCTL_REPOSITORY_ROOT:-$HOME/.local/share/envctl/repos}"
+readonly ENVCTL_CHECKOUT="$REPOSITORY_ROOT/envctl"
+readonly ENV_CONFIG_CHECKOUT="$REPOSITORY_ROOT/env-config"
+readonly ENVCTL_BINARY="$HOME/.local/bin/envctl"
+readonly BOOTSTRAP_STATE="$HOME/.local/state/envctl/bootstrap"
+
+log() {
+	printf '==> %s\n' "$*"
+}
+
+fail() {
+	printf 'bootstrap: %s\n' "$*" >&2
+	exit 1
+}
+
+require_regular_file() {
+	local path="$1"
+	[[ -f "$path" && ! -L "$path" ]] ||
+		fail "required recovery file is missing or unsafe: $path"
+}
+
+configure_brew_path() {
+	if [[ -x /opt/homebrew/bin/brew ]]; then
+		eval "$(/opt/homebrew/bin/brew shellenv)"
+	elif [[ -x /usr/local/bin/brew ]]; then
+		eval "$(/usr/local/bin/brew shellenv)"
+	fi
+}
+
+install_prerequisites() {
+	[[ "$(uname -s)" == "Darwin" ]] || fail "this bootstrap supports macOS only"
+
+	if ! xcode-select -p >/dev/null 2>&1; then
+		log "Requesting Xcode Command Line Tools"
+		xcode-select --install
+		fail "finish the Command Line Tools installation, then rerun this script"
+	fi
+
+	configure_brew_path
+	if ! command -v brew >/dev/null 2>&1; then
+		log "Installing Homebrew with the official installer"
+		mkdir -p "$BOOTSTRAP_STATE"
+		local installer="$BOOTSTRAP_STATE/homebrew-install.sh"
+		curl -fsSL \
+			https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh \
+			-o "$installer"
+		/bin/bash "$installer"
+		configure_brew_path
+	fi
+	command -v brew >/dev/null 2>&1 || fail "Homebrew is unavailable after installation"
+
+	log "Installing bootstrap prerequisites"
+	brew install age gh git go sops
+}
+
+install_age_identity() {
+	require_regular_file "$RECOVERY_AGE_IDENTITY"
+	mkdir -p "$(dirname "$LOCAL_AGE_IDENTITY")"
+	chmod 0700 "$(dirname "$LOCAL_AGE_IDENTITY")"
+	if [[ -e "$LOCAL_AGE_IDENTITY" ]]; then
+		[[ -f "$LOCAL_AGE_IDENTITY" && ! -L "$LOCAL_AGE_IDENTITY" ]] ||
+			fail "local age identity is not a regular file: $LOCAL_AGE_IDENTITY"
+		cmp -s "$RECOVERY_AGE_IDENTITY" "$LOCAL_AGE_IDENTITY" ||
+			fail "local age identity differs from the iCloud recovery identity"
+	else
+		install -m 0600 "$RECOVERY_AGE_IDENTITY" "$LOCAL_AGE_IDENTITY"
+	fi
+	chmod 0600 "$LOCAL_AGE_IDENTITY"
+}
+
+install_deploy_key() {
+	require_regular_file "$RECOVERY_DEPLOY_KEY"
+	mkdir -p "$HOME/.ssh"
+	chmod 0700 "$HOME/.ssh"
+
+	if [[ ! -e "$LOCAL_DEPLOY_KEY" ]]; then
+		local temporary_key="$LOCAL_DEPLOY_KEY.bootstrap"
+		[[ ! -e "$temporary_key" ]] ||
+			fail "temporary deploy key already exists: $temporary_key"
+		umask 077
+		age --decrypt \
+			--identity "$LOCAL_AGE_IDENTITY" \
+			--output "$temporary_key" \
+			"$RECOVERY_DEPLOY_KEY"
+		chmod 0600 "$temporary_key"
+		mv "$temporary_key" "$LOCAL_DEPLOY_KEY"
+	fi
+
+	[[ -f "$LOCAL_DEPLOY_KEY" && ! -L "$LOCAL_DEPLOY_KEY" ]] ||
+		fail "local deploy key is not a regular file: $LOCAL_DEPLOY_KEY"
+	chmod 0600 "$LOCAL_DEPLOY_KEY"
+	local actual_fingerprint
+	actual_fingerprint="$(ssh-keygen -lf "$LOCAL_DEPLOY_KEY" | awk '{print $2}')"
+	[[ "$actual_fingerprint" == "$EXPECTED_DEPLOY_FINGERPRINT" ]] ||
+		fail "env-config deploy-key fingerprint does not match the bootstrap"
+}
+
+install_github_host_key() {
+	local known_hosts="$HOME/.ssh/known_hosts"
+	touch "$known_hosts"
+	chmod 0600 "$known_hosts"
+	if ! grep -Fqx "$GITHUB_ED25519_HOST_KEY" "$known_hosts"; then
+		printf '%s\n' "$GITHUB_ED25519_HOST_KEY" >>"$known_hosts"
+	fi
+}
+
+sync_checkout() {
+	local repository="$1"
+	local ref="$2"
+	local checkout="$3"
+	local ssh_command="${4:-}"
+
+	if [[ -e "$checkout" && ! -d "$checkout/.git" ]]; then
+		fail "checkout path exists but is not a Git repository: $checkout"
+	fi
+
+	if [[ ! -e "$checkout" ]]; then
+		mkdir -p "$(dirname "$checkout")"
+		log "Cloning $repository"
+		if [[ -n "$ssh_command" ]]; then
+			GIT_SSH_COMMAND="$ssh_command" \
+				git clone --branch "$ref" --single-branch "$repository" "$checkout"
+		else
+			git clone --branch "$ref" --single-branch "$repository" "$checkout"
+		fi
+		return
+	fi
+
+	[[ -z "$(git -C "$checkout" status --porcelain)" ]] ||
+		fail "checkout has local changes: $checkout"
+	[[ "$(git -C "$checkout" remote get-url origin)" == "$repository" ]] ||
+		fail "checkout origin does not match $repository: $checkout"
+	[[ "$(git -C "$checkout" branch --show-current)" == "$ref" ]] ||
+		fail "checkout is not on expected branch $ref: $checkout"
+
+	log "Fast-forwarding $checkout"
+	if [[ -n "$ssh_command" ]]; then
+		GIT_SSH_COMMAND="$ssh_command" git -C "$checkout" fetch origin "$ref"
+	else
+		git -C "$checkout" fetch origin "$ref"
+	fi
+	git -C "$checkout" merge --ff-only "origin/$ref"
+}
+
+build_envctl() {
+	mkdir -p "$HOME/.local/bin" "$BOOTSTRAP_STATE"
+	local candidate="$BOOTSTRAP_STATE/envctl.candidate"
+	local go_binary
+	go_binary="$(brew --prefix go)/bin/go"
+	[[ -x "$go_binary" ]] || fail "Homebrew Go is unavailable: $go_binary"
+	log "Building envctl"
+	(
+		cd "$ENVCTL_CHECKOUT"
+		unset GOROOT GOTOOLDIR GOBIN
+		export GOENV=off
+		export GOFLAGS=
+		export GOTOOLCHAIN=local
+		export GOWORK=off
+		"$go_binary" build -trimpath -o "$candidate" ./cmd/envctl
+	)
+	chmod 0755 "$candidate"
+	if [[ -f "$ENVCTL_BINARY" && ! -L "$ENVCTL_BINARY" ]]; then
+		cp -p "$ENVCTL_BINARY" "$BOOTSTRAP_STATE/envctl.previous"
+	fi
+	mv "$candidate" "$ENVCTL_BINARY"
+}
+
+verify_foundation() {
+	log "Verifying encrypted config and installed envctl"
+	sops decrypt \
+		--output-type dotenv \
+		"$ENV_CONFIG_CHECKOUT/secrets/shell.sops.env" >/dev/null
+	if "$ENVCTL_BINARY" help | grep -Fq "envctl config validate"; then
+		"$ENVCTL_BINARY" config validate \
+			--config "$ENV_CONFIG_CHECKOUT" \
+			--json >/dev/null
+	else
+		# Supports a bootstrap script synced before its envctl PR is merged.
+		"$ENVCTL_BINARY" config resolve \
+			--config "$ENV_CONFIG_CHECKOUT" \
+			--machine ai \
+			--json >/dev/null
+	fi
+	"$ENVCTL_BINARY" audit --json --no-record \
+		>"$BOOTSTRAP_STATE/initial-audit.json"
+}
+
+main() {
+	require_regular_file "$RECOVERY_AGE_IDENTITY"
+	require_regular_file "$RECOVERY_DEPLOY_KEY"
+	install_prerequisites
+	install_age_identity
+	install_deploy_key
+	install_github_host_key
+
+	local deploy_ssh
+	deploy_ssh="ssh -i $LOCAL_DEPLOY_KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o ControlMaster=no -o ControlPath=none"
+	sync_checkout "$ENVCTL_PUBLIC_REPO" "$ENVCTL_PUBLIC_REF" "$ENVCTL_CHECKOUT"
+	sync_checkout \
+		"$ENV_CONFIG_PRIVATE_REPO" \
+		"$ENV_CONFIG_PRIVATE_REF" \
+		"$ENV_CONFIG_CHECKOUT" \
+		"$deploy_ssh"
+	build_envctl
+	verify_foundation
+
+	printf '\nBootstrap foundation complete.\n'
+	printf 'envctl:    %s\n' "$ENVCTL_BINARY"
+	printf 'code:      %s\n' "$ENVCTL_CHECKOUT"
+	printf 'config:    %s\n' "$ENV_CONFIG_CHECKOUT"
+	printf 'inventory: %s\n' "$BOOTSTRAP_STATE/initial-audit.json"
+	printf '\nPackage/config onboarding is not enabled yet; no desired state was applied.\n'
+}
+
+main "$@"

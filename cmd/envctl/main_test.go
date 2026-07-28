@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -26,6 +28,77 @@ func TestUnknownCommand(t *testing.T) {
 	err := run(context.Background(), []string{"unknown"}, &stdout, &stderr)
 	if err == nil {
 		t.Fatal("run(unknown) error = nil, want error")
+	}
+}
+
+func TestConfigValidateLoadsEveryMachine(t *testing.T) {
+	root := t.TempDir()
+	files := map[string]string{
+		"envctl.yaml": `
+version: 1
+catalog: catalog/packages.yaml
+profiles: profiles
+machines: machines
+`,
+		"catalog/packages.yaml": `
+version: 1
+packages:
+  fzf:
+    manager: brew
+    kind: formula
+    source: homebrew/core
+    package: fzf
+    update_policy: managed
+`,
+		"profiles/shared.yaml": `
+version: 1
+name: shared
+packages:
+  - fzf
+`,
+		"machines/one.yaml": `
+version: 1
+id: one
+profiles:
+  - shared
+access:
+  type: local
+`,
+		"machines/two.yaml": `
+version: 1
+id: two
+profiles:
+  - shared
+access:
+  type: ssh
+  host: two
+`,
+	}
+	for relative, contents := range files {
+		path := filepath.Join(root, relative)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	var stdout, stderr bytes.Buffer
+	err := run(
+		context.Background(),
+		[]string{"config", "validate", "--config", root, "--json"},
+		&stdout, &stderr,
+	)
+	if err != nil {
+		t.Fatalf("run(config validate) error = %v", err)
+	}
+	var got configValidationResponse
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	if !got.Valid || strings.Join(got.Machines, ",") != "one,two" {
+		t.Fatalf("validation result = %#v", got)
 	}
 }
 
