@@ -94,7 +94,7 @@ exit 2
 	}
 }
 
-func TestBootstrapPreservesAlignedOnboardingChanges(t *testing.T) {
+func TestBootstrapPreservesOnboardingChangesAcrossFastForward(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
 	seed := filepath.Join(root, "seed")
@@ -175,11 +175,61 @@ func TestBootstrapPreservesAlignedOnboardingChanges(t *testing.T) {
 	)
 	command.Env = append(os.Environ(), "HOME="+filepath.Join(root, "home"))
 	output, err = command.CombinedOutput()
-	if err == nil {
-		t.Fatalf("advanced dirty checkout unexpectedly succeeded:\n%s", output)
+	if err != nil {
+		t.Fatalf("advanced dirty checkout failed: %v\n%s", err, output)
 	}
-	if !strings.Contains(string(output), "origin/main has advanced") {
-		t.Fatalf("advanced checkout error = %s", output)
+	if !strings.Contains(string(output), "Preserving local onboarding changes") {
+		t.Fatalf("bootstrap output = %s", output)
+	}
+	if _, err := os.Stat(filepath.Join(machines, "new-mac.yaml")); err != nil {
+		t.Fatalf("onboarding file was not preserved after fast-forward: %v", err)
+	}
+	readme, err := os.ReadFile(filepath.Join(checkout, "README.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(readme) != "advanced\n" {
+		t.Fatalf("README after fast-forward = %q", readme)
+	}
+
+	if err := os.WriteFile(
+		filepath.Join(checkout, "README.md"),
+		[]byte("local edit\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(seed, "README.md"),
+		[]byte("advanced again\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, seed, "add", "README.md")
+	runGit(t, seed, "commit", "-m", "advance again")
+	runGit(t, seed, "push", "origin", "main")
+
+	command = exec.Command(
+		"/bin/bash",
+		"-c",
+		`source "$1"; sync_checkout "$2" main "$3" "" true`,
+		"bootstrap-test",
+		scriptPath,
+		remote,
+		checkout,
+	)
+	command.Env = append(os.Environ(), "HOME="+filepath.Join(root, "home"))
+	output, err = command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("conflicting dirty checkout unexpectedly succeeded:\n%s", output)
+	}
+	readme, readErr := os.ReadFile(filepath.Join(checkout, "README.md"))
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(readme) != "local edit\n" {
+		t.Fatalf("conflicting local edit was changed: %q", readme)
 	}
 }
 
