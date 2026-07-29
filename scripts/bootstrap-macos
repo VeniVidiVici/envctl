@@ -178,14 +178,7 @@ sync_checkout() {
 		git -C "$checkout" fetch origin "$ref"
 	fi
 	if [[ -n "$local_changes" ]]; then
-		local local_commit
-		local remote_commit
-		local_commit="$(git -C "$checkout" rev-parse HEAD)"
-		remote_commit="$(git -C "$checkout" rev-parse "origin/$ref")"
-		[[ "$local_commit" == "$remote_commit" ]] ||
-			fail "checkout has local changes and origin/$ref has advanced: $checkout"
 		log "Preserving local onboarding changes in $checkout"
-		return
 	fi
 	git -C "$checkout" merge --ff-only "origin/$ref"
 }
