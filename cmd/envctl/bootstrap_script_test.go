@@ -35,6 +35,7 @@ func TestBootstrapLaunchesSingleInteractiveSetupFlow(t *testing.T) {
 		"Launching interactive onboarding and guided setup",
 		`"$ENVCTL_BINARY" onboard \`,
 		`--setup`,
+		`--auto`,
 		`"${BASH_SOURCE[0]}" == "$0"`,
 	} {
 		if !strings.Contains(script, fragment) {

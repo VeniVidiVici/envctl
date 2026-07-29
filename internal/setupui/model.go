@@ -89,6 +89,7 @@ type Model struct {
 	cursor        int
 	confirming    bool
 	running       bool
+	automatic     bool
 	width         int
 	statusMessage string
 }
@@ -102,12 +103,20 @@ func New(machineID string, phases []Phase, factory CommandFactory) *Model {
 	}
 }
 
+func (m *Model) Automatic() *Model {
+	m.automatic = true
+	return m
+}
+
 func Run(model *Model) error {
 	_, err := tea.NewProgram(model).Run()
 	return err
 }
 
 func (m *Model) Init() tea.Cmd {
+	if m.automatic {
+		return m.runNextAutomatic()
+	}
 	return nil
 }
 
@@ -162,6 +171,10 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.phases[index].Status = StatusCompleted
 			m.phases[index].Actions = 0
 			m.statusMessage = m.phases[index].Label + " completed and verified"
+		}
+		if m.automatic {
+			m.cursor = index + 1
+			return m, m.runNextAutomatic()
 		}
 	}
 	return m, nil
@@ -257,9 +270,15 @@ func (m *Model) View() tea.View {
 		body.WriteString("\n")
 	}
 	body.WriteString("\n")
-	body.WriteString(mutedStyle.Render(
-		"j/k move   enter run/review   q quit",
-	))
+	if m.automatic {
+		body.WriteString(mutedStyle.Render(
+			"automatic ordered setup   q stop",
+		))
+	} else {
+		body.WriteString(mutedStyle.Render(
+			"j/k move   enter run/review   q quit",
+		))
+	}
 
 	view := tea.NewView(body.String())
 	view.AltScreen = true
@@ -319,6 +338,43 @@ func (m *Model) runSelected() tea.Cmd {
 	return tea.ExecProcess(command, func(err error) tea.Msg {
 		return phaseFinishedMsg{id: id, err: err}
 	})
+}
+
+func (m *Model) runNextAutomatic() tea.Cmd {
+	if !m.automatic || m.running {
+		return nil
+	}
+	for m.cursor < len(m.phases) {
+		phase := m.phases[m.cursor]
+		switch phase.Status {
+		case StatusSatisfied, StatusCompleted, StatusReviewed:
+			m.cursor++
+		case StatusReady, StatusReview:
+			if !m.dependenciesComplete(phase) {
+				m.statusMessage = phase.Label +
+					" has incomplete dependencies; automatic setup stopped"
+				return nil
+			}
+			m.statusMessage = "Automatically running " + phase.Label
+			return m.runSelected()
+		case StatusBlocked:
+			m.statusMessage = phase.Label +
+				" is blocked; automatic setup stopped"
+			return nil
+		case StatusFailed:
+			m.statusMessage = phase.Label +
+				" failed; automatic setup stopped"
+			return nil
+		case StatusRunning:
+			return nil
+		default:
+			m.statusMessage = phase.Label +
+				" has an unsupported state; automatic setup stopped"
+			return nil
+		}
+	}
+	m.statusMessage = "Automatic setup completed"
+	return tea.Quit
 }
 
 func (m *Model) dependenciesComplete(phase Phase) bool {

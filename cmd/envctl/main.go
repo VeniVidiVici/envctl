@@ -43,8 +43,8 @@ const usage = `envctl is a read-first macOS environment manager.
 
 Usage:
   envctl audit --json [--state PATH] [--no-record]
-  envctl onboard --config DIR [--json] [--machine ID] [--profiles A,B] [--setup]
-  envctl setup --config DIR --machine ID --local [--json]
+  envctl onboard --config DIR [--json] [--machine ID] [--profiles A,B] [--setup] [--auto]
+  envctl setup --config DIR --machine ID --local [--json] [--auto]
   envctl import-legacy --input PATH
   envctl config validate --config DIR --json
   envctl config resolve --config DIR --machine ID --json
@@ -130,6 +130,11 @@ func runSetup(
 		"require this Mac's registered identity and execute phases locally",
 	)
 	asJSON := flags.Bool("json", false, "print the unified setup plan as JSON")
+	automatic := flags.Bool(
+		"auto",
+		false,
+		"run executable phases in dependency order without per-phase confirmation",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -138,6 +143,9 @@ func runSetup(
 	}
 	if !*localMachine {
 		return errors.New("setup currently requires --local")
+	}
+	if *asJSON && *automatic {
+		return errors.New("--json and --auto cannot be combined")
 	}
 	loaded, err := envconfig.Load(*configRoot, *machineID)
 	if err != nil {
@@ -161,11 +169,15 @@ func runSetup(
 	if err != nil {
 		return fmt.Errorf("locate envctl executable: %w", err)
 	}
-	return setupui.Run(setupui.New(
+	model := setupui.New(
 		loaded.Machine.ID,
 		phases,
 		setupui.ProcessFactory{Context: ctx, Executable: executable},
-	))
+	)
+	if *automatic {
+		model.Automatic()
+	}
+	return setupui.Run(model)
 }
 
 func buildSetupPhases(
@@ -514,6 +526,11 @@ func runOnboard(
 		false,
 		"continue directly into guided setup after registration",
 	)
+	automaticSetup := flags.Bool(
+		"auto",
+		false,
+		"run guided setup phases automatically; requires --setup",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -522,6 +539,9 @@ func runOnboard(
 	}
 	if *asJSON && *continueSetup {
 		return errors.New("--json and --setup cannot be combined")
+	}
+	if *automaticSetup && !*continueSetup {
+		return errors.New("--auto requires --setup")
 	}
 	machines, err := envconfig.Machines(*configRoot)
 	if err != nil {
@@ -546,13 +566,17 @@ func runOnboard(
 		return err
 	}
 	if *continueSetup && result.Status == onboard.StatusMatched {
+		setupArgs := []string{
+			"--config", *configRoot,
+			"--machine", result.MachineID,
+			"--local",
+		}
+		if *automaticSetup {
+			setupArgs = append(setupArgs, "--auto")
+		}
 		return runSetup(
 			ctx,
-			[]string{
-				"--config", *configRoot,
-				"--machine", result.MachineID,
-				"--local",
-			},
+			setupArgs,
 			stdout,
 			stderr,
 		)
@@ -601,13 +625,17 @@ func runOnboard(
 		"\nMachine %s registered locally. Launching guided setup.\n\n",
 		writtenMachineID,
 	)
+	setupArgs := []string{
+		"--config", *configRoot,
+		"--machine", writtenMachineID,
+		"--local",
+	}
+	if *automaticSetup {
+		setupArgs = append(setupArgs, "--auto")
+	}
 	return runSetup(
 		ctx,
-		[]string{
-			"--config", *configRoot,
-			"--machine", writtenMachineID,
-			"--local",
-		},
+		setupArgs,
 		stdout,
 		stderr,
 	)

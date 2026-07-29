@@ -51,6 +51,15 @@ For an already registered Mac, this proceeds directly to setup. `--local` is
 accepted only when the current Mac's hardware fingerprint matches the requested
 machine; it cannot be used to bypass machine selection.
 
+The clean-Mac bootstrap adds `--auto`. That mode runs executable phases in
+dependency order without asking for a separate confirmation for each phase.
+It stops on the first blocker or failure, and review-only or explicitly manual
+items retain their existing safety boundaries:
+
+```sh
+envctl onboard --config /path/to/env-config --setup --auto
+```
+
 Run or resume first-run convergence with:
 
 ```sh
@@ -125,9 +134,10 @@ deploy key in iCloud's `Env Secrets` directory. It installs only the tools
 needed to clone both repositories and build envctl, verifies the encrypted
 config, and records an initial read-only audit. In an interactive terminal, the
 same command asks for the machine ID and profiles, registers the machine
-locally, and continues directly into guided setup. Every mutating setup phase
-still requires explicit confirmation. In a noninteractive terminal, it prints
-the exact interactive command to run later. A rerun preserves an
+locally, and continues directly into ordered guided setup. Selecting the machine
+and profiles authorizes executable setup phases; the workflow stops on the
+first blocker or failure. In a noninteractive terminal, it prints the exact
+interactive command to run later. A rerun preserves an
 onboarding-created machine file when the private checkout has not advanced
 upstream.
 
