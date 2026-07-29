@@ -2,6 +2,7 @@ package fleetui
 
 import (
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -32,6 +33,11 @@ type DecisionWriter interface {
 	SaveDecision(machineID, inventoryKey, value, profile string) error
 }
 
+type Reconciler interface {
+	Preview(machineID string) (fleetreconcile.Plan, error)
+	Command(machineID string) (*exec.Cmd, error)
+}
+
 type decisionSavedMsg struct {
 	machineID    string
 	inventoryKey string
@@ -39,9 +45,20 @@ type decisionSavedMsg struct {
 	err          error
 }
 
+type reconcilePreviewMsg struct {
+	plan fleetreconcile.Plan
+	err  error
+}
+
+type reconcileFinishedMsg struct {
+	err error
+}
+
 type Model struct {
 	machines      []Machine
 	writer        DecisionWriter
+	reconciler    Reconciler
+	launchProcess func(*exec.Cmd, tea.ExecCallback) tea.Cmd
 	decisions     map[string]string
 	machineIndex  int
 	cursor        int
@@ -49,6 +66,10 @@ type Model struct {
 	width         int
 	height        int
 	statusMessage string
+	preview       *fleetreconcile.Plan
+	previewing    bool
+	confirming    bool
+	running       bool
 }
 
 var filters = []string{"attention", "missing", "extra", "not-checked", "all"}
@@ -63,12 +84,28 @@ func New(
 		decisionMap[decisionMapKey(decision.MachineID, decision.InventoryKey)] = decision.Value
 	}
 	return &Model{
-		machines:  machines,
-		writer:    writer,
-		decisions: decisionMap,
-		width:     100,
-		height:    30,
+		machines:      machines,
+		writer:        writer,
+		decisions:     decisionMap,
+		launchProcess: tea.ExecProcess,
+		width:         100,
+		height:        30,
 	}
+}
+
+func (m *Model) WithReconciler(reconciler Reconciler) *Model {
+	m.reconciler = reconciler
+	return m
+}
+
+func (m *Model) SelectMachine(machineID string) *Model {
+	for index, machine := range m.machines {
+		if machine.ID == machineID {
+			m.machineIndex = index
+			break
+		}
+	}
+	return m
 }
 
 func Run(model *Model) error {
@@ -87,6 +124,23 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.height = message.Height
 		m.clampCursor()
 	case tea.KeyPressMsg:
+		if m.running || m.previewing {
+			return m, nil
+		}
+		if m.confirming {
+			switch message.String() {
+			case "y":
+				m.confirming = false
+				return m, m.runReconciliation()
+			case "n", "esc":
+				m.preview = nil
+				m.confirming = false
+				m.statusMessage = "Reconciliation cancelled"
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			}
+			return m, nil
+		}
 		switch message.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -116,6 +170,13 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			return m, m.saveSelectedDecision("remove")
 		case "c":
 			return m, m.saveSelectedDecision("clear")
+		case "r":
+			return m, m.previewReconciliation()
+		case "n", "esc":
+			if m.preview != nil {
+				m.preview = nil
+				m.statusMessage = "Reconciliation preview dismissed"
+			}
 		}
 	case decisionSavedMsg:
 		if message.err != nil {
@@ -130,6 +191,34 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.decisions[key] = message.value
 			m.statusMessage = "Decision saved: " + message.value
 		}
+	case reconcilePreviewMsg:
+		m.previewing = false
+		if message.err != nil {
+			m.statusMessage = "Could not preview reconciliation: " + message.err.Error()
+			return m, nil
+		}
+		m.preview = &message.plan
+		planned := plannedActions(message.plan.Actions)
+		if !message.plan.Ready {
+			m.statusMessage = fmt.Sprintf(
+				"Reconciliation has %d blocker(s); review the preview",
+				len(message.plan.Blockers),
+			)
+			return m, nil
+		}
+		if len(planned) == 0 {
+			m.statusMessage = "No reviewed changes are ready to reconcile"
+			return m, nil
+		}
+		m.confirming = true
+	case reconcileFinishedMsg:
+		m.running = false
+		if message.err != nil {
+			m.statusMessage = "Reconciliation failed: " + message.err.Error()
+			return m, nil
+		}
+		m.applySuccessfulPreview()
+		m.statusMessage = "Reconciliation completed and verified"
 	}
 	return m, nil
 }
@@ -265,10 +354,31 @@ func (m *Model) View() tea.View {
 		body.WriteString("\n")
 	}
 
+	if m.preview != nil {
+		body.WriteString("\n")
+		body.WriteString(detailStyle.Width(max(20, m.width-4)).Render(
+			m.renderReconciliationPreview(),
+		))
+		body.WriteString("\n")
+	}
+
 	body.WriteString("\n")
-	body.WriteString(mutedStyle.Render(
-		"[ / ] machine   j/k move   f filter   e extras   a sync to fleet   p keep local   i ignore   x uninstall here   c clear   q quit",
-	))
+	switch {
+	case m.running:
+		body.WriteString(mutedStyle.Render(
+			"Reconciliation is running in the attached terminal…",
+		))
+	case m.previewing:
+		body.WriteString(mutedStyle.Render("Preparing reconciliation preview…"))
+	case m.confirming:
+		body.WriteString(mutedStyle.Render(
+			"y apply these reviewed changes   n/esc cancel   q quit",
+		))
+	default:
+		body.WriteString(mutedStyle.Render(
+			"[ / ] machine   j/k move   f filter   e extras   a sync to fleet   p keep local   i ignore   x uninstall here   c clear   r reconcile   q quit",
+		))
+	}
 	if m.statusMessage != "" {
 		body.WriteString("\n")
 		body.WriteString(m.statusMessage)
@@ -278,6 +388,142 @@ func (m *Model) View() tea.View {
 	view.AltScreen = true
 	view.WindowTitle = "envctl fleet"
 	return view
+}
+
+func (m *Model) previewReconciliation() tea.Cmd {
+	if m.reconciler == nil {
+		m.statusMessage = "Reconciliation is unavailable in this session"
+		return nil
+	}
+	if len(m.machines) == 0 {
+		return nil
+	}
+	m.previewing = true
+	m.preview = nil
+	m.statusMessage = ""
+	machineID := m.machines[m.machineIndex].ID
+	return func() tea.Msg {
+		plan, err := m.reconciler.Preview(machineID)
+		return reconcilePreviewMsg{plan: plan, err: err}
+	}
+}
+
+func (m *Model) runReconciliation() tea.Cmd {
+	if m.reconciler == nil || m.preview == nil {
+		m.statusMessage = "No reconciliation preview is available"
+		return nil
+	}
+	command, err := m.reconciler.Command(m.preview.MachineID)
+	if err != nil {
+		m.statusMessage = "Could not start reconciliation: " + err.Error()
+		return nil
+	}
+	m.running = true
+	return m.launchProcess(command, func(err error) tea.Msg {
+		return reconcileFinishedMsg{err: err}
+	})
+}
+
+func (m *Model) renderReconciliationPreview() string {
+	if m.preview == nil {
+		return ""
+	}
+	lines := []string{
+		fmt.Sprintf(
+			"Reconcile reviewed extras on %s → profile %s",
+			m.preview.MachineID, m.preview.Profile,
+		),
+	}
+	for _, action := range m.preview.Actions {
+		if action.Status != fleetreconcile.StatusPlanned &&
+			action.Status != fleetreconcile.StatusBlocked {
+			continue
+		}
+		label := strings.ToUpper(action.Decision)
+		target := action.Installed.Package
+		if action.Decision == "adopt" {
+			target = action.PackageID + " → " + action.Profile
+		}
+		lines = append(lines, fmt.Sprintf(
+			"  %-7s %-32s %s", label, target, action.Status,
+		))
+		if action.Command != nil {
+			lines = append(lines, "          command: "+
+				displayCommand(action.Command.Name, action.Command.Args))
+		}
+		if action.Status == fleetreconcile.StatusBlocked {
+			lines = append(lines, "          "+action.Detail)
+		}
+	}
+	switch {
+	case len(m.preview.Blockers) > 0:
+		lines = append(lines, fmt.Sprintf(
+			"Blocked: %d issue(s) must be reviewed first",
+			len(m.preview.Blockers),
+		))
+	case len(plannedActions(m.preview.Actions)) == 0:
+		lines = append(lines, "No reviewed changes are ready to reconcile.")
+	default:
+		lines = append(lines,
+			"Press y to apply and verify, or n to cancel.")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m *Model) applySuccessfulPreview() {
+	if m.preview == nil {
+		return
+	}
+	resolved := make(map[string]fleetreconcile.Action)
+	for _, action := range m.preview.Actions {
+		if action.Status == fleetreconcile.StatusPlanned {
+			resolved[action.InventoryKey] = action
+			delete(m.decisions, decisionMapKey(action.MachineID, action.InventoryKey))
+		}
+	}
+	for machineIndex := range m.machines {
+		if m.machines[machineIndex].ID != m.preview.MachineID {
+			continue
+		}
+		findings := m.machines[machineIndex].Plan.Findings
+		kept := make([]model.Finding, 0, len(findings))
+		for _, finding := range findings {
+			if finding.Status != model.FindingExtra || len(finding.Installed) == 0 {
+				kept = append(kept, finding)
+				continue
+			}
+			action, ok := resolved[InventoryKey(finding.Installed[0])]
+			if !ok {
+				kept = append(kept, finding)
+				continue
+			}
+			if m.machines[machineIndex].Plan.Summary.Extra > 0 {
+				m.machines[machineIndex].Plan.Summary.Extra--
+			}
+			if action.Decision == "adopt" {
+				m.machines[machineIndex].Plan.Summary.Satisfied++
+			}
+		}
+		m.machines[machineIndex].Plan.Findings = kept
+		break
+	}
+	m.preview = nil
+	m.confirming = false
+	m.cursor = 0
+}
+
+func plannedActions(actions []fleetreconcile.Action) []fleetreconcile.Action {
+	var planned []fleetreconcile.Action
+	for _, action := range actions {
+		if action.Status == fleetreconcile.StatusPlanned {
+			planned = append(planned, action)
+		}
+	}
+	return planned
+}
+
+func displayCommand(name string, args []string) string {
+	return strings.Join(append([]string{name}, args...), " ")
 }
 
 func (m *Model) filteredFindings() []model.Finding {

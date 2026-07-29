@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -55,10 +56,10 @@ Usage:
   envctl recovery plan --config DIR --machine ID --local --json
   envctl recovery apply --config DIR --machine ID --local --json (--dry-run | --yes)
   envctl history --json [--state PATH] [--limit N]
-  envctl tui --config DIR --inventory-dir DIR [--state PATH]
-  envctl fleet refresh --config DIR --inventory-dir DIR --json
-  envctl fleet export-decisions --config DIR [--state PATH] --json
-  envctl fleet reconcile --config DIR --inventory-dir DIR --machine ID --local --json (--dry-run | --yes)
+  envctl tui [--config DIR] [--inventory-dir DIR] [--state PATH]
+  envctl fleet refresh [--config DIR] [--inventory-dir DIR] [--machines A,B] [--json]
+  envctl fleet export-decisions [--config DIR] [--state PATH] [--json]
+  envctl fleet reconcile [--config DIR] [--inventory-dir DIR] [--machine ID] (--dry-run | --yes) [--json]
 `
 
 func main() {
@@ -2537,17 +2538,25 @@ func runFleetTUI(ctx context.Context, args []string, stderr io.Writer) error {
 		"inventory-dir", "", "directory containing MACHINE.json audit files",
 	)
 	statePath := flags.String("state", "", "SQLite state database path")
+	refreshLocal := flags.Bool(
+		"refresh", true, "refresh this Mac's inventory before opening",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *configRoot == "" || *inventoryDirectory == "" {
-		return errors.New("--config and --inventory-dir are required")
-	}
-	expandedInventoryDirectory, err := expandHome(*inventoryDirectory)
+	resolvedConfigRoot, err := resolveConfigRoot(*configRoot)
 	if err != nil {
 		return err
 	}
-	machineIDs, err := envconfig.MachineIDs(*configRoot)
+	resolvedInventoryDirectory, err := resolveInventoryDirectory(*inventoryDirectory)
+	if err != nil {
+		return err
+	}
+	localMachineID, err := detectConfiguredLocalMachine(ctx, resolvedConfigRoot)
+	if err != nil {
+		return err
+	}
+	machineIDs, err := envconfig.MachineIDs(resolvedConfigRoot)
 	if err != nil {
 		return err
 	}
@@ -2559,7 +2568,20 @@ func runFleetTUI(ctx context.Context, args []string, stderr io.Writer) error {
 		machines       []fleetui.Machine
 		configDatabase string
 	)
-	refreshStatus, refreshStatusErr := fleetrefresh.LoadStatus(expandedInventoryDirectory)
+	if *refreshLocal {
+		loaded, err := envconfig.Load(resolvedConfigRoot, localMachineID)
+		if err != nil {
+			return err
+		}
+		inventory := collectInventory(ctx, loaded.Desired.Links)
+		if err := writeInventory(
+			filepath.Join(resolvedInventoryDirectory, localMachineID+".json"),
+			inventory,
+		); err != nil {
+			return err
+		}
+	}
+	refreshStatus, refreshStatusErr := fleetrefresh.LoadStatus(resolvedInventoryDirectory)
 	refreshResults := make(map[string]fleetrefresh.Result)
 	if refreshStatusErr != nil && !errors.Is(refreshStatusErr, os.ErrNotExist) {
 		return fmt.Errorf("load fleet refresh status: %w", refreshStatusErr)
@@ -2570,7 +2592,7 @@ func runFleetTUI(ctx context.Context, args []string, stderr io.Writer) error {
 		}
 	}
 	for _, machineID := range machineIDs {
-		loaded, err := envconfig.Load(*configRoot, machineID)
+		loaded, err := envconfig.Load(resolvedConfigRoot, machineID)
 		if err != nil {
 			return err
 		}
@@ -2578,15 +2600,21 @@ func runFleetTUI(ctx context.Context, args []string, stderr io.Writer) error {
 			configDatabase = loaded.Database
 		}
 		inventory, err := loadInventory(
-			filepath.Join(expandedInventoryDirectory, machineID+".json"),
+			filepath.Join(resolvedInventoryDirectory, machineID+".json"),
 		)
 		if err != nil {
-			return fmt.Errorf("load %s inventory: %w", machineID, err)
+			if !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("load %s inventory: %w", machineID, err)
+			}
+			inventory = model.Inventory{}
 		}
 		plan := planInventory(
 			loaded.Desired.Packages, loaded.Desired.Links, inventory,
 		)
 		refreshResult := refreshResults[machineID]
+		if machineID == localMachineID && *refreshLocal {
+			refreshResult.Status = "ok"
+		}
 		machines = append(machines, fleetui.Machine{
 			ID: machineID, Profiles: loaded.Desired.Profiles, Plan: plan,
 			CollectedAt:      inventory.CollectedAt,
@@ -2623,11 +2651,109 @@ func runFleetTUI(ctx context.Context, args []string, stderr io.Writer) error {
 			Value: decision.Value,
 		})
 	}
-	return fleetui.Run(fleetui.New(
+	executable, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("locate envctl executable: %w", err)
+	}
+	localLoaded, err := envconfig.Load(resolvedConfigRoot, localMachineID)
+	if err != nil {
+		return err
+	}
+	profileName := preferredReconcileProfile(localLoaded.Desired.Profiles)
+	model := fleetui.New(
 		machines,
 		decisions,
 		stateDecisionWriter{ctx: ctx, state: state},
+	).WithReconciler(fleetTUIReconciler{
+		ctx: ctx, executable: executable,
+		configRoot:         resolvedConfigRoot,
+		inventoryDirectory: resolvedInventoryDirectory,
+		statePath:          databasePath,
+		profileName:        profileName,
+		localMachineID:     localMachineID,
+		state:              state,
+	}).SelectMachine(localMachineID)
+	return fleetui.Run(model)
+}
+
+type fleetTUIReconciler struct {
+	ctx                context.Context
+	executable         string
+	configRoot         string
+	inventoryDirectory string
+	statePath          string
+	profileName        string
+	localMachineID     string
+	state              *store.Store
+}
+
+func (r fleetTUIReconciler) Preview(
+	machineID string,
+) (fleetreconcile.Plan, error) {
+	if machineID != r.localMachineID {
+		return fleetreconcile.Plan{}, fmt.Errorf(
+			"reconciliation is local-only; select %s", r.localMachineID,
+		)
+	}
+	loaded, err := envconfig.Load(r.configRoot, machineID)
+	if err != nil {
+		return fleetreconcile.Plan{}, err
+	}
+	profile, err := fleetreconcile.ProfileByName(loaded.Profiles, r.profileName)
+	if err != nil {
+		return fleetreconcile.Plan{}, err
+	}
+	inventory, err := loadInventory(filepath.Join(
+		r.inventoryDirectory, machineID+".json",
 	))
+	if err != nil {
+		return fleetreconcile.Plan{}, err
+	}
+	decisions, err := r.state.LatestDecisions(r.ctx, machineID)
+	if err != nil {
+		return fleetreconcile.Plan{}, err
+	}
+	return fleetreconcile.Build(
+		machineID, r.profileName, decisions, inventory,
+		loaded.Catalog.Packages, profile,
+	), nil
+}
+
+func (r fleetTUIReconciler) Command(machineID string) (*exec.Cmd, error) {
+	if machineID != r.localMachineID {
+		return nil, fmt.Errorf(
+			"reconciliation is local-only; select %s", r.localMachineID,
+		)
+	}
+	if r.executable == "" {
+		return nil, errors.New("envctl executable is unavailable")
+	}
+	arguments := []string{
+		"fleet", "reconcile",
+		"--config", r.configRoot,
+		"--inventory-dir", r.inventoryDirectory,
+		"--machine", machineID,
+		"--profile", r.profileName,
+		"--local", "--yes", "--json",
+	}
+	if r.statePath != "" {
+		arguments = append(arguments, "--state", r.statePath)
+	}
+	command := exec.CommandContext(r.ctx, r.executable, arguments...)
+	command.Stdout = io.Discard
+	return command, nil
+}
+
+func preferredReconcileProfile(profiles []string) string {
+	for _, profile := range profiles {
+		if profile == "shared" {
+			return profile
+		}
+	}
+	if len(profiles) > 0 {
+		return profiles[len(profiles)-1]
+	}
+	return "shared"
 }
 
 func runFleet(
@@ -2636,7 +2762,9 @@ func runFleet(
 	stdout, stderr io.Writer,
 ) error {
 	if len(args) == 0 {
-		return errors.New("usage: envctl fleet refresh --config DIR --inventory-dir DIR --json")
+		return errors.New(
+			"usage: envctl fleet (refresh | export-decisions | reconcile)",
+		)
 	}
 	switch args[0] {
 	case "refresh":
@@ -2690,7 +2818,7 @@ func runFleetReconcile(
 	)
 	statePath := flags.String("state", "", "SQLite state database path")
 	localMachine := flags.Bool(
-		"local", false, "verify this Mac's identity before local removals",
+		"local", true, "verify this Mac's identity before local removals",
 	)
 	dryRun := flags.Bool(
 		"dry-run", false, "print reviewed config edits and uninstall commands",
@@ -2698,12 +2826,23 @@ func runFleetReconcile(
 	yes := flags.Bool(
 		"yes", false, "apply the reviewed config edits and local removals",
 	)
-	asJSON := flags.Bool("json", false, "print reconciliation as JSON")
+	asJSON := flags.Bool("json", true, "print reconciliation as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if *configRoot == "" || *inventoryDirectory == "" || *machineID == "" {
-		return errors.New("--config, --inventory-dir, and --machine are required")
+	resolvedConfigRoot, err := resolveConfigRoot(*configRoot)
+	if err != nil {
+		return err
+	}
+	resolvedInventoryDirectory, err := resolveInventoryDirectory(*inventoryDirectory)
+	if err != nil {
+		return err
+	}
+	if *machineID == "" {
+		*machineID, err = detectConfiguredLocalMachine(ctx, resolvedConfigRoot)
+		if err != nil {
+			return err
+		}
 	}
 	if !*localMachine {
 		return errors.New("fleet reconciliation currently requires --local")
@@ -2714,11 +2853,7 @@ func runFleetReconcile(
 	if *dryRun == *yes {
 		return errors.New("exactly one of --dry-run or --yes is required")
 	}
-	expandedInventoryDirectory, err := expandHome(*inventoryDirectory)
-	if err != nil {
-		return err
-	}
-	loaded, err := envconfig.Load(*configRoot, *machineID)
+	loaded, err := envconfig.Load(resolvedConfigRoot, *machineID)
 	if err != nil {
 		return err
 	}
@@ -2730,7 +2865,7 @@ func runFleetReconcile(
 		return err
 	}
 	inventory, err := loadInventory(filepath.Join(
-		expandedInventoryDirectory, *machineID+".json",
+		resolvedInventoryDirectory, *machineID+".json",
 	))
 	if err != nil {
 		return fmt.Errorf("load %s inventory: %w", *machineID, err)
@@ -2829,7 +2964,7 @@ func runFleetReconcile(
 		switch action.Decision {
 		case "adopt":
 			configResult, err := envconfig.AdoptPackages(
-				*configRoot, *profileName,
+				resolvedConfigRoot, *profileName,
 				[]envconfig.PackageAdoption{{
 					ID: action.PackageID, Spec: *action.Spec,
 				}},
@@ -2892,11 +3027,17 @@ func runFleetReconcile(
 		}
 	}
 
-	reloaded, err := envconfig.Load(*configRoot, *machineID)
+	reloaded, err := envconfig.Load(resolvedConfigRoot, *machineID)
 	if err != nil {
 		return fmt.Errorf("reload reconciled configuration: %w", err)
 	}
 	afterInventory := collectInventory(ctx, reloaded.Desired.Links)
+	if err := writeInventory(
+		filepath.Join(resolvedInventoryDirectory, *machineID+".json"),
+		afterInventory,
+	); err != nil {
+		return fmt.Errorf("write verified inventory: %w", err)
+	}
 	verificationSnapshot, err := state.RecordAudit(
 		ctx,
 		store.MachineInfo{ID: *machineID, Hostname: hostname},
@@ -3041,17 +3182,18 @@ func runFleetExportDecisions(
 		"output", "reviews/fleet-decisions.yaml",
 		"output path relative to the config root",
 	)
-	asJSON := flags.Bool("json", false, "print export result as JSON")
+	asJSON := flags.Bool("json", true, "print export result as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
-	}
-	if *configRoot == "" {
-		return errors.New("--config is required")
 	}
 	if !*asJSON {
 		return errors.New("the initial decision export command currently requires --json")
 	}
-	machineIDs, err := envconfig.MachineIDs(*configRoot)
+	resolvedConfigRoot, err := resolveConfigRoot(*configRoot)
+	if err != nil {
+		return err
+	}
+	machineIDs, err := envconfig.MachineIDs(resolvedConfigRoot)
 	if err != nil {
 		return err
 	}
@@ -3060,7 +3202,7 @@ func runFleetExportDecisions(
 	}
 	databasePath := *statePath
 	if databasePath == "" {
-		loaded, err := envconfig.Load(*configRoot, machineIDs[0])
+		loaded, err := envconfig.Load(resolvedConfigRoot, machineIDs[0])
 		if err != nil {
 			return err
 		}
@@ -3080,7 +3222,7 @@ func runFleetExportDecisions(
 		knownMachines[machineID] = true
 	}
 	result, err := decisionexport.Write(
-		*configRoot, *outputPath, decisions, knownMachines,
+		resolvedConfigRoot, *outputPath, decisions, knownMachines,
 	)
 	if err != nil {
 		return err
@@ -3104,21 +3246,22 @@ func runFleetRefresh(
 	selectedMachines := flags.String(
 		"machines", "", "comma-separated machine ids; defaults to all",
 	)
-	asJSON := flags.Bool("json", false, "print refresh status as JSON")
+	asJSON := flags.Bool("json", true, "print refresh status as JSON")
 	if err := flags.Parse(args); err != nil {
 		return err
-	}
-	if *configRoot == "" || *inventoryDirectory == "" {
-		return errors.New("--config and --inventory-dir are required")
 	}
 	if !*asJSON {
 		return errors.New("the initial fleet refresh command currently requires --json")
 	}
-	expandedInventoryDirectory, err := expandHome(*inventoryDirectory)
+	resolvedConfigRoot, err := resolveConfigRoot(*configRoot)
 	if err != nil {
 		return err
 	}
-	machineIDs, err := envconfig.MachineIDs(*configRoot)
+	resolvedInventoryDirectory, err := resolveInventoryDirectory(*inventoryDirectory)
+	if err != nil {
+		return err
+	}
+	machineIDs, err := envconfig.MachineIDs(resolvedConfigRoot)
 	if err != nil {
 		return err
 	}
@@ -3130,7 +3273,7 @@ func runFleetRefresh(
 	}
 	targets := make([]fleetrefresh.Target, 0, len(machineIDs))
 	for _, machineID := range machineIDs {
-		loaded, err := envconfig.Load(*configRoot, machineID)
+		loaded, err := envconfig.Load(resolvedConfigRoot, machineID)
 		if err != nil {
 			return err
 		}
@@ -3145,7 +3288,7 @@ func runFleetRefresh(
 	}
 	status, err := fleetrefresh.New(
 		executable,
-		expandedInventoryDirectory,
+		resolvedInventoryDirectory,
 		fleetrefresh.ExecRunner{},
 	).Refresh(ctx, targets)
 	if err != nil {
