@@ -175,6 +175,18 @@ func runSetup(
 		setupui.ProcessFactory{Context: ctx, Executable: executable},
 	)
 	if *automatic {
+		if automaticSetupNeedsSudo(phases) {
+			stopSudoKeeper, err := authorizeAutomaticSetup(
+				ctx,
+				stdout,
+				stderr,
+				automaticSudoRefreshInterval,
+			)
+			if err != nil {
+				return err
+			}
+			defer stopSudoKeeper()
+		}
 		model.Automatic()
 	}
 	return setupui.Run(model)
