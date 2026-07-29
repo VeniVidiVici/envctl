@@ -183,9 +183,18 @@ build_envctl() {
 
 verify_foundation() {
 	log "Verifying encrypted config and installed envctl"
-	sops decrypt \
-		--output-type dotenv \
-		"$ENV_CONFIG_CHECKOUT/secrets/shell.sops.env" >/dev/null
+	(
+		unset \
+			SOPS_AGE_KEY \
+			SOPS_AGE_KEY_CMD \
+			SOPS_AGE_KEY_FILE \
+			SOPS_AGE_SSH_PRIVATE_KEY_CMD \
+			SOPS_AGE_SSH_PRIVATE_KEY_FILE
+		export SOPS_AGE_KEY_FILE="$LOCAL_AGE_IDENTITY"
+		sops decrypt \
+			--output-type dotenv \
+			"$ENV_CONFIG_CHECKOUT/secrets/shell.sops.env" >/dev/null
+	)
 	if "$ENVCTL_BINARY" help | grep -Fq "envctl config validate"; then
 		"$ENVCTL_BINARY" config validate \
 			--config "$ENV_CONFIG_CHECKOUT" \
