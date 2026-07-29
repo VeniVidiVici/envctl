@@ -185,21 +185,10 @@ go run ./cmd/envctl recovery apply \
 go run ./cmd/envctl config resolve \
   --config ./examples/env-config --machine example-mac --json
 go run ./cmd/envctl history --json
-go run ./cmd/envctl tui \
-  --config ../env-config \
-  --inventory-dir ~/.local/state/envctl/migration-20260728
-go run ./cmd/envctl fleet refresh \
-  --config ../env-config \
-  --inventory-dir ~/.local/state/envctl/migration-20260728 \
-  --json
-go run ./cmd/envctl fleet export-decisions \
-  --config ../env-config \
-  --json
-go run ./cmd/envctl fleet reconcile \
-  --config ../env-config \
-  --inventory-dir ~/.local/state/envctl/migration-20260728 \
-  --machine example-mac \
-  --local --dry-run --json
+go run ./cmd/envctl tui
+go run ./cmd/envctl fleet refresh
+go run ./cmd/envctl fleet export-decisions
+go run ./cmd/envctl fleet reconcile --dry-run
 go test ./...
 ```
 
@@ -278,11 +267,19 @@ Audits and plans are recorded in `~/.local/state/envctl/state.db` by default.
 Use `--no-record` for an entirely ephemeral run or `--state PATH` to select a
 different database.
 
+`envctl tui` discovers the bootstrap config checkout first, then
+`~/Documents/env-config`; it uses `~/.local/state/envctl/inventory`, identifies
+the current Mac from its registered hardware fingerprint, and refreshes that
+Mac's inventory on entry. `ENVCTL_CONFIG` and `ENVCTL_INVENTORY_DIR` override
+the defaults, while the existing flags remain available for unusual layouts.
+
 The fleet TUI highlights installed packages that are absent from desired state
 as `EXTRA`; press `e` to show only those findings. Press `a` to review an item
-for adoption into the shared profile, `x` to review it for removal from the
-selected Mac, `p` to keep it local, or `i` to ignore it. The TUI records intent
-but never changes configuration or installed software itself.
+for adoption into the shared profile, `x` to review it for removal from this
+Mac, `p` to keep it local, or `i` to ignore it. Press `r` to preview all
+reviewed changes in the TUI, then `y` to apply and verify them or `n` to cancel.
+The terminal is temporarily released during apply so macOS password and Touch
+ID prompts work normally.
 
 `fleet refresh` is agentless. For SSH machines it checks that the remote
 platform matches the current binary, copies envctl to a random `/tmp` path,
@@ -296,8 +293,9 @@ to `reviews/fleet-decisions.yaml` in the private config checkout. The result is
 a deterministic Git-reviewable handoff with structured manager, kind, source,
 and package fields; exporting does not apply a decision.
 
-`fleet reconcile --dry-run` joins those reviewed decisions to the selected
-machine's saved inventory and prints the exact result. Adoption adds a
+`fleet reconcile --dry-run` remains available for automation and joins reviewed
+decisions to this Mac's saved inventory using the same discovered defaults.
+Adoption adds a
 validated catalog entry and shared-profile reference so Git can carry it to the
 other Macs. Removal prints an exact fixed-argv uninstall command for Homebrew,
 Mac App Store, Bun, or Mise. `--yes` is required to edit configuration or

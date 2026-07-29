@@ -2,11 +2,13 @@ package fleetui
 
 import (
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
 
+	"github.com/VeniVidiVici/envctl/internal/fleetreconcile"
 	"github.com/VeniVidiVici/envctl/internal/model"
 )
 
@@ -16,6 +18,23 @@ type fakeWriter struct {
 	value   string
 	profile string
 	err     error
+}
+
+type fakeReconciler struct {
+	plan    fleetreconcile.Plan
+	err     error
+	command *exec.Cmd
+}
+
+func (r fakeReconciler) Preview(string) (fleetreconcile.Plan, error) {
+	return r.plan, r.err
+}
+
+func (r fakeReconciler) Command(string) (*exec.Cmd, error) {
+	if r.command == nil {
+		return exec.Command("/usr/bin/true"), r.err
+	}
+	return r.command, r.err
 }
 
 func (w *fakeWriter) SaveDecision(machine, key, value, profile string) error {
@@ -136,6 +155,74 @@ func TestViewContainsFleetSummary(t *testing.T) {
 		if !strings.Contains(content, expected) {
 			t.Fatalf("view does not contain %q:\n%s", expected, content)
 		}
+	}
+}
+
+func TestReconciliationPreviewRequiresYAndUpdatesResolvedExtra(t *testing.T) {
+	item := model.InstalledPackage{
+		Manager: model.ManagerBrew, Kind: model.KindCask,
+		Source: "homebrew/cask", Package: "firefox",
+	}
+	action := fleetreconcile.Action{
+		Sequence: 1, MachineID: "example", InventoryKey: InventoryKey(item),
+		Decision: "adopt", Status: fleetreconcile.StatusPlanned,
+		Installed: item, PackageID: "firefox", Profile: "shared",
+	}
+	view := New([]Machine{{
+		ID: "example",
+		Plan: model.Plan{
+			Summary: model.PlanSummary{Extra: 1},
+			Findings: []model.Finding{{
+				Status:    model.FindingExtra,
+				Installed: []model.InstalledPackage{item},
+			}},
+		},
+	}}, []Decision{{
+		MachineID: "example", InventoryKey: InventoryKey(item), Value: "adopt",
+	}}, &fakeWriter{}).WithReconciler(fakeReconciler{
+		plan: fleetreconcile.Plan{
+			MachineID: "example", Profile: "shared",
+			Actions: []fleetreconcile.Action{action}, Ready: true,
+		},
+	})
+	view.launchProcess = func(
+		_ *exec.Cmd, callback tea.ExecCallback,
+	) tea.Cmd {
+		return func() tea.Msg { return callback(nil) }
+	}
+
+	_, previewCommand := view.Update(keyMessage("r"))
+	view.Update(previewCommand())
+	if !view.confirming ||
+		!strings.Contains(view.View().Content, "Press y to apply") {
+		t.Fatalf("preview was not shown:\n%s", view.View().Content)
+	}
+	_, applyCommand := view.Update(keyMessage("y"))
+	if applyCommand == nil || !view.running {
+		t.Fatal("confirmed reconciliation did not start")
+	}
+	view.Update(applyCommand())
+	if view.running || view.preview != nil ||
+		len(view.machines[0].Plan.Findings) != 0 ||
+		view.machines[0].Plan.Summary.Extra != 0 ||
+		view.machines[0].Plan.Summary.Satisfied != 1 {
+		t.Fatalf("model was not updated after reconciliation: %#v", view)
+	}
+}
+
+func TestBlockedReconciliationCannotBeConfirmed(t *testing.T) {
+	view := New([]Machine{{ID: "example"}}, nil, &fakeWriter{}).
+		WithReconciler(fakeReconciler{plan: fleetreconcile.Plan{
+			MachineID: "example", Profile: "shared", Ready: false,
+			Blockers: []string{"custom removal is unsupported"},
+		}})
+	_, previewCommand := view.Update(keyMessage("r"))
+	view.Update(previewCommand())
+	if view.confirming {
+		t.Fatal("blocked reconciliation entered confirmation state")
+	}
+	if !strings.Contains(view.View().Content, "Blocked: 1") {
+		t.Fatalf("blocked preview missing:\n%s", view.View().Content)
 	}
 }
 
