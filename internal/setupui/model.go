@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 
@@ -69,8 +70,11 @@ func (f ProcessFactory) Command(phase Phase) (*exec.Cmd, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// ExecProcess attaches all three streams after releasing the TUI's terminal.
+	// ExecProcess attaches stdin and stderr after releasing the TUI's terminal.
+	// Phase commands return machine-readable JSON on stdout; the setup UI only
+	// needs their exit status, so keep that payload out of the user's terminal.
 	command := exec.CommandContext(ctx, f.Executable, phase.Command...)
+	command.Stdout = io.Discard
 	return command, nil
 }
 
@@ -195,6 +199,7 @@ func (m *Model) View() tea.View {
 		Foreground(lipgloss.Color("#A3BE8C"))
 
 	var body strings.Builder
+	selectedIndex := m.selectedIndex()
 	body.WriteString(titleStyle.Render("envctl setup"))
 	body.WriteString(mutedStyle.Render("  guided first-run convergence"))
 	body.WriteString("\n\n")
@@ -214,7 +219,7 @@ func (m *Model) View() tea.View {
 			phase.Actions,
 			phase.Blockers,
 		)
-		if index == m.cursor {
+		if index == selectedIndex {
 			line = selectedStyle.Width(max(1, m.width-2)).Render(line)
 		} else if phaseComplete(phase.Status) {
 			line = successStyle.Render(line)
@@ -224,7 +229,7 @@ func (m *Model) View() tea.View {
 	}
 
 	if len(m.phases) > 0 {
-		selected := m.phases[m.cursor]
+		selected := m.phases[selectedIndex]
 		body.WriteString("\n")
 		body.WriteString(selected.Description)
 		body.WriteString("\n")
@@ -380,7 +385,23 @@ func (m *Model) runNextAutomatic() tea.Cmd {
 		}
 	}
 	m.statusMessage = "Automatic setup completed"
+	if len(m.phases) > 0 {
+		m.cursor = len(m.phases) - 1
+	}
 	return tea.Quit
+}
+
+func (m *Model) selectedIndex() int {
+	if len(m.phases) == 0 {
+		return -1
+	}
+	if m.cursor < 0 {
+		return 0
+	}
+	if m.cursor >= len(m.phases) {
+		return len(m.phases) - 1
+	}
+	return m.cursor
 }
 
 func (m *Model) dependenciesComplete(phase Phase) bool {

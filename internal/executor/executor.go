@@ -5,9 +5,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/VeniVidiVici/envctl/internal/model"
@@ -38,9 +40,11 @@ type Journal interface {
 	SkipAction(ctx context.Context, sequence int, reason string) error
 }
 
-type ExecRunner struct{}
+type ExecRunner struct {
+	Progress io.Writer
+}
 
-func (ExecRunner) Run(
+func (r ExecRunner) Run(
 	ctx context.Context,
 	name string,
 	args ...string,
@@ -51,8 +55,26 @@ func (ExecRunner) Run(
 	command.Stdin = os.Stdin
 	command.Stdout = &stdout
 	command.Stderr = &stderr
+	if r.Progress != nil {
+		fmt.Fprintf(r.Progress, "\n==> Running %s\n", displayCommand(name, args))
+		command.Stdout = io.MultiWriter(&stdout, r.Progress)
+		command.Stderr = io.MultiWriter(&stderr, r.Progress)
+	}
 	err := command.Run()
 	return stdout.String(), stderr.String(), err
+}
+
+func displayCommand(name string, args []string) string {
+	parts := make([]string, 0, len(args)+1)
+	parts = append(parts, name)
+	for _, argument := range args {
+		if strings.ContainsAny(argument, " \t\n\"'") {
+			parts = append(parts, strconv.Quote(argument))
+		} else {
+			parts = append(parts, argument)
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 type Command struct {
