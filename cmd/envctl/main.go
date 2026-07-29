@@ -293,6 +293,17 @@ func buildRecoverySetupPhase(
 	}
 	phase.Actions = len(plan.Actions)
 	phase.Blockers = len(plan.Blockers)
+	for _, blocker := range plan.Blockers {
+		phase.Diagnostics = append(
+			phase.Diagnostics,
+			fmt.Sprintf(
+				"%s (%s): %s",
+				blocker.RecoveryID,
+				blocker.Status,
+				blocker.Detail,
+			),
+		)
+	}
 	switch {
 	case phase.Blockers > 0:
 		phase.Status = setupui.StatusBlocked
@@ -336,6 +347,17 @@ func buildLinkSetupPhase(
 	}
 	phase.Actions = len(plan.Actions)
 	phase.Blockers = len(plan.Blockers)
+	for _, blocker := range plan.Blockers {
+		phase.Diagnostics = append(
+			phase.Diagnostics,
+			fmt.Sprintf(
+				"%s (%s): %s",
+				blocker.LinkID,
+				blocker.Status,
+				blocker.Detail,
+			),
+		)
+	}
 	switch {
 	case phase.Blockers > 0:
 		phase.Status = setupui.StatusBlocked
@@ -385,6 +407,12 @@ func buildManagerSetupPhase(
 	} else {
 		_, blocked := classifyActions(selected)
 		phase.Blockers = len(blocked)
+		for _, item := range blocked {
+			phase.Diagnostics = append(
+				phase.Diagnostics,
+				item.Action.PackageID+": "+item.Reason,
+			)
+		}
 		switch {
 		case phase.Blockers > 0:
 			phase.Status = setupui.StatusBlocked
