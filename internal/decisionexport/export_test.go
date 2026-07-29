@@ -43,6 +43,10 @@ func TestWriteProducesStableFilteredYAML(t *testing.T) {
 		"inventory_key: brew|formula|homebrew/core|fzf",
 		"decision: adopt",
 		"profile: shared",
+		"manager: brew",
+		"kind: formula",
+		"source: homebrew/core",
+		"package: fzf",
 	} {
 		if !strings.Contains(text, expected) {
 			t.Fatalf("export does not contain %q:\n%s", expected, text)

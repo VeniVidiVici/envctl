@@ -61,6 +61,27 @@ func TestDecisionIsSavedOnlyForExtraFinding(t *testing.T) {
 	}
 }
 
+func TestAdoptPrefersSharedProfileOverMachineSpecificProfile(t *testing.T) {
+	writer := &fakeWriter{}
+	item := model.InstalledPackage{
+		Manager: model.ManagerBrew, Kind: model.KindCask,
+		Source: "homebrew/cask", Package: "example",
+	}
+	view := New([]Machine{{
+		ID: "example-mac", Profiles: []string{"shared", "workstation"},
+		Plan: model.Plan{Findings: []model.Finding{{
+			Status:    model.FindingExtra,
+			Installed: []model.InstalledPackage{item},
+		}}},
+	}}, nil, writer)
+
+	_, command := view.Update(keyMessage("a"))
+	view.Update(command())
+	if writer.profile != "shared" {
+		t.Fatalf("saved profile = %q, want shared", writer.profile)
+	}
+}
+
 func TestDecisionFailureIsShown(t *testing.T) {
 	writer := &fakeWriter{err: errors.New("database unavailable")}
 	item := model.InstalledPackage{

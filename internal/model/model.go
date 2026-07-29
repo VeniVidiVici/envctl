@@ -174,6 +174,8 @@ type ActionType string
 
 const (
 	ActionInstall             ActionType = "package.install"
+	ActionAdopt               ActionType = "package.adopt"
+	ActionRemove              ActionType = "package.remove"
 	ActionReinstallFromSource ActionType = "package.reinstall-from-source"
 	ActionReview              ActionType = "manual.review"
 )

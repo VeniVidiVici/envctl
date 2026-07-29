@@ -195,6 +195,11 @@ go run ./cmd/envctl fleet refresh \
 go run ./cmd/envctl fleet export-decisions \
   --config ../env-config \
   --json
+go run ./cmd/envctl fleet reconcile \
+  --config ../env-config \
+  --inventory-dir ~/.local/state/envctl/migration-20260728 \
+  --machine example-mac \
+  --local --dry-run --json
 go test ./...
 ```
 
@@ -273,9 +278,11 @@ Audits and plans are recorded in `~/.local/state/envctl/state.db` by default.
 Use `--no-record` for an entirely ephemeral run or `--state PATH` to select a
 different database.
 
-The fleet TUI is review-only. It can record `adopt`, `keep`, `ignore`, and
-`remove` decisions for extra installed packages, but it cannot install or
-delete anything.
+The fleet TUI highlights installed packages that are absent from desired state
+as `EXTRA`; press `e` to show only those findings. Press `a` to review an item
+for adoption into the shared profile, `x` to review it for removal from the
+selected Mac, `p` to keep it local, or `i` to ignore it. The TUI records intent
+but never changes configuration or installed software itself.
 
 `fleet refresh` is agentless. For SSH machines it checks that the remote
 platform matches the current binary, copies envctl to a random `/tmp` path,
@@ -286,7 +293,20 @@ visit.
 
 `fleet export-decisions` writes the latest decision for each reviewed package
 to `reviews/fleet-decisions.yaml` in the private config checkout. The result is
-a deterministic Git-reviewable handoff; exporting does not apply a decision.
+a deterministic Git-reviewable handoff with structured manager, kind, source,
+and package fields; exporting does not apply a decision.
+
+`fleet reconcile --dry-run` joins those reviewed decisions to the selected
+machine's saved inventory and prints the exact result. Adoption adds a
+validated catalog entry and shared-profile reference so Git can carry it to the
+other Macs. Removal prints an exact fixed-argv uninstall command for Homebrew,
+Mac App Store, Bun, or Mise. `--yes` is required to edit configuration or
+uninstall anything, verifies the local machine identity, journals every action,
+validates the configuration for every registered machine, and confirms removed
+packages are absent before completing. Mac App Store removal runs through
+`sudo`, so the labelled action line appears immediately before any macOS
+password prompt. Custom and manual package removal remains blocked for manual
+review.
 
 ## Safety boundary
 
@@ -294,5 +314,7 @@ Git-backed configuration will be the desired state. SQLite will contain only
 local inventory, plans, and run history. Secret values, key material, and
 application session state must never be written to the database or logs.
 
-No executor may widen the current apply boundary without new validation,
-journaling, verification, and tests.
+The normal desired-state executor does not remove extras automatically.
+Removal is available only through an explicit saved fleet decision followed by
+`fleet reconcile --yes`, with validation, journaling, and post-action
+verification.
