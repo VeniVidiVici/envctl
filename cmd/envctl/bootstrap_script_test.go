@@ -30,6 +30,7 @@ func TestBootstrapPinsSOPSIdentity(t *testing.T) {
 func TestBootstrapLaunchesSingleInteractiveSetupFlow(t *testing.T) {
 	script := readBootstrapScript(t)
 	for _, fragment := range []string{
+		"Command Line Tools installation complete; continuing bootstrap",
 		"Launching interactive onboarding and guided setup",
 		`"$ENVCTL_BINARY" onboard \`,
 		`--setup`,
@@ -38,6 +39,56 @@ func TestBootstrapLaunchesSingleInteractiveSetupFlow(t *testing.T) {
 		if !strings.Contains(script, fragment) {
 			t.Fatalf("bootstrap script is missing %q", fragment)
 		}
+	}
+}
+
+func TestBootstrapContinuesAfterCommandLineToolsInstall(t *testing.T) {
+	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(bin, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(root, "installed")
+	xcodeSelect := filepath.Join(bin, "xcode-select")
+	stub := `#!/bin/bash
+if [[ "$1" == "-p" ]]; then
+	test -f "$ENVCTL_TEST_CLT_MARKER"
+	exit
+fi
+if [[ "$1" == "--install" ]]; then
+	touch "$ENVCTL_TEST_CLT_MARKER"
+	exit
+fi
+exit 2
+`
+	if err := os.WriteFile(xcodeSelect, []byte(stub), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	scriptPath, err := filepath.Abs(
+		filepath.Join("..", "..", "scripts", "bootstrap-macos"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(
+		"/bin/bash",
+		"-c",
+		`source "$1"; interactive_terminal() { return 0; }; ensure_command_line_tools`,
+		"bootstrap-test",
+		scriptPath,
+	)
+	command.Env = append(
+		os.Environ(),
+		"HOME="+filepath.Join(root, "home"),
+		"PATH="+bin+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"ENVCTL_TEST_CLT_MARKER="+marker,
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("continue after Command Line Tools: %v\n%s", err, output)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("Command Line Tools install was not requested: %v", err)
 	}
 }
 

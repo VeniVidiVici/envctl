@@ -29,6 +29,10 @@ fail() {
 	exit 1
 }
 
+interactive_terminal() {
+	[[ -t 0 && -t 1 ]]
+}
+
 require_regular_file() {
 	local path="$1"
 	[[ -f "$path" && ! -L "$path" ]] ||
@@ -43,14 +47,27 @@ configure_brew_path() {
 	fi
 }
 
+ensure_command_line_tools() {
+	if xcode-select -p >/dev/null 2>&1; then
+		return
+	fi
+	interactive_terminal ||
+		fail "Command Line Tools are missing; rerun bootstrap interactively"
+
+	log "Requesting Xcode Command Line Tools"
+	xcode-select --install >/dev/null 2>&1 || true
+	while ! xcode-select -p >/dev/null 2>&1; do
+		printf "\nComplete Apple's Command Line Tools installer.\n"
+		printf 'Return here and press Enter when installation finishes: '
+		IFS= read -r _
+	done
+	log "Command Line Tools installation complete; continuing bootstrap"
+}
+
 install_prerequisites() {
 	[[ "$(uname -s)" == "Darwin" ]] || fail "this bootstrap supports macOS only"
 
-	if ! xcode-select -p >/dev/null 2>&1; then
-		log "Requesting Xcode Command Line Tools"
-		xcode-select --install
-		fail "finish the Command Line Tools installation, then rerun this script"
-	fi
+	ensure_command_line_tools
 
 	configure_brew_path
 	if ! command -v brew >/dev/null 2>&1; then
@@ -235,7 +252,7 @@ verify_foundation() {
 }
 
 launch_guided_setup() {
-	if [[ -t 0 && -t 1 ]]; then
+	if interactive_terminal; then
 		log "Launching interactive onboarding and guided setup"
 		"$ENVCTL_BINARY" onboard \
 			--config "$ENV_CONFIG_CHECKOUT" \
