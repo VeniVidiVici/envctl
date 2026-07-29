@@ -43,7 +43,7 @@ func (r *fakeRunner) Run(
 	if name == "/bin/launchctl" {
 		return []byte("service registered\n"), nil
 	}
-	if name == "/usr/bin/env" {
+	if name == "/usr/local/bin/tailscale" {
 		return []byte(
 			`{"BackendState":"Running","Self":{"Online":true}}`,
 		), nil

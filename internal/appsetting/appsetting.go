@@ -223,8 +223,7 @@ func (m *Manager) verifyTailscaleAfterRestart(
 
 	statusOutput, statusErr := m.runner.Run(
 		ctx,
-		"/usr/bin/env",
-		"tailscale",
+		"/usr/local/bin/tailscale",
 		"status",
 		"--json",
 	)
