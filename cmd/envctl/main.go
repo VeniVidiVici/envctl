@@ -43,7 +43,7 @@ const usage = `envctl is a read-first macOS environment manager.
 
 Usage:
   envctl audit --json [--state PATH] [--no-record]
-  envctl onboard --config DIR [--json] [--machine ID] [--profiles A,B]
+  envctl onboard --config DIR [--json] [--machine ID] [--profiles A,B] [--setup]
   envctl setup --config DIR --machine ID --local [--json]
   envctl import-legacy --input PATH
   envctl config validate --config DIR --json
@@ -481,11 +481,19 @@ func runOnboard(
 		"profiles", "", "comma-separated profiles for a new machine",
 	)
 	asJSON := flags.Bool("json", false, "print the onboarding result as JSON")
+	continueSetup := flags.Bool(
+		"setup",
+		false,
+		"continue directly into guided setup after registration",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
 	if *configRoot == "" {
 		return errors.New("--config is required")
+	}
+	if *asJSON && *continueSetup {
+		return errors.New("--json and --setup cannot be combined")
 	}
 	machines, err := envconfig.Machines(*configRoot)
 	if err != nil {
@@ -508,6 +516,18 @@ func runOnboard(
 	)
 	if err != nil {
 		return err
+	}
+	if *continueSetup && result.Status == onboard.StatusMatched {
+		return runSetup(
+			ctx,
+			[]string{
+				"--config", *configRoot,
+				"--machine", result.MachineID,
+				"--local",
+			},
+			stdout,
+			stderr,
+		)
 	}
 	if result.Status == onboard.StatusMatched {
 		loaded, err := envconfig.Load(*configRoot, result.MachineID)
@@ -537,9 +557,32 @@ func runOnboard(
 	if *asJSON {
 		return encodeJSON(stdout, result)
 	}
-	return onboardui.Run(onboardui.New(
-		result, *configRoot, onboardui.FileWriter{},
-	))
+	model := onboardui.New(result, *configRoot, onboardui.FileWriter{})
+	if *continueSetup {
+		model.ContinueIntoSetup()
+	}
+	if err := onboardui.Run(model); err != nil {
+		return err
+	}
+	writtenMachineID := model.WrittenMachineID()
+	if !*continueSetup || writtenMachineID == "" {
+		return nil
+	}
+	fmt.Fprintf(
+		stdout,
+		"\nMachine %s registered locally. Launching guided setup.\n\n",
+		writtenMachineID,
+	)
+	return runSetup(
+		ctx,
+		[]string{
+			"--config", *configRoot,
+			"--machine", writtenMachineID,
+			"--local",
+		},
+		stdout,
+		stderr,
+	)
 }
 
 type recoveryPlanResponse struct {
