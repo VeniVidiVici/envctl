@@ -37,13 +37,19 @@ envctl onboard --config /path/to/env-config
 Onboarding hashes the platform UUID before it leaves the local identity
 collector. It can add that fingerprint to a clean existing machine file or
 create a proposed machine overlay, but only after an explicit two-key
-confirmation. It does not commit, push, install packages, or apply links.
-Use `--json` for a read-only, scriptable result.
+confirmation. A new Mac first asks the user to accept or replace its suggested
+machine ID, then select profiles. It does not commit or push. Use `--json` for
+a read-only, scriptable result.
 
-Once the identity is registered, onboarding includes a live local plan and
-hands off to the guided setup TUI. `--local` is accepted
-only when the current Mac's hardware fingerprint matches the requested machine;
-it cannot be used to bypass machine selection.
+Pass `--setup` to continue directly into the guided setup TUI after registration:
+
+```sh
+envctl onboard --config /path/to/env-config --setup
+```
+
+For an already registered Mac, this proceeds directly to setup. `--local` is
+accepted only when the current Mac's hardware fingerprint matches the requested
+machine; it cannot be used to bypass machine selection.
 
 Run or resume first-run convergence with:
 
@@ -117,10 +123,13 @@ For a clean Mac, `scripts/bootstrap-macos` is the versioned bootstrap
 foundation. It expects the age identity and encrypted read-only `env-config`
 deploy key in iCloud's `Env Secrets` directory. It installs only the tools
 needed to clone both repositories and build envctl, verifies the encrypted
-config, and records an initial read-only audit. Desired-state convergence is
-intentionally not automatic. In an interactive terminal, the script continues
-into onboarding and then points to the setup TUI; otherwise it prints the exact
-onboarding command to run later.
+config, and records an initial read-only audit. In an interactive terminal, the
+same command asks for the machine ID and profiles, registers the machine
+locally, and continues directly into guided setup. Every mutating setup phase
+still requires explicit confirmation. In a noninteractive terminal, it prints
+the exact interactive command to run later. A rerun preserves an
+onboarding-created machine file when the private checkout has not advanced
+upstream.
 
 Then launch the fleet review TUI with:
 

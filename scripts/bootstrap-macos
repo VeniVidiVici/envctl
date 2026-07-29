@@ -125,6 +125,7 @@ sync_checkout() {
 	local ref="$2"
 	local checkout="$3"
 	local ssh_command="${4:-}"
+	local preserve_local_changes="${5:-false}"
 
 	if [[ -e "$checkout" && ! -d "$checkout/.git" ]]; then
 		fail "checkout path exists but is not a Git repository: $checkout"
@@ -142,18 +143,32 @@ sync_checkout() {
 		return
 	fi
 
-	[[ -z "$(git -C "$checkout" status --porcelain)" ]] ||
-		fail "checkout has local changes: $checkout"
 	[[ "$(git -C "$checkout" remote get-url origin)" == "$repository" ]] ||
 		fail "checkout origin does not match $repository: $checkout"
 	[[ "$(git -C "$checkout" branch --show-current)" == "$ref" ]] ||
 		fail "checkout is not on expected branch $ref: $checkout"
+
+	local local_changes
+	local_changes="$(git -C "$checkout" status --porcelain)"
+	if [[ -n "$local_changes" && "$preserve_local_changes" != "true" ]]; then
+		fail "checkout has local changes: $checkout"
+	fi
 
 	log "Fast-forwarding $checkout"
 	if [[ -n "$ssh_command" ]]; then
 		GIT_SSH_COMMAND="$ssh_command" git -C "$checkout" fetch origin "$ref"
 	else
 		git -C "$checkout" fetch origin "$ref"
+	fi
+	if [[ -n "$local_changes" ]]; then
+		local local_commit
+		local remote_commit
+		local_commit="$(git -C "$checkout" rev-parse HEAD)"
+		remote_commit="$(git -C "$checkout" rev-parse "origin/$ref")"
+		[[ "$local_commit" == "$remote_commit" ]] ||
+			fail "checkout has local changes and origin/$ref has advanced: $checkout"
+		log "Preserving local onboarding changes in $checkout"
+		return
 	fi
 	git -C "$checkout" merge --ff-only "origin/$ref"
 }
@@ -219,14 +234,17 @@ verify_foundation() {
 		>"$BOOTSTRAP_STATE/initial-audit.json"
 }
 
-launch_onboarding() {
+launch_guided_setup() {
 	if [[ -t 0 && -t 1 ]]; then
-		log "Launching envctl onboarding"
-		"$ENVCTL_BINARY" onboard --config "$ENV_CONFIG_CHECKOUT"
+		log "Launching interactive onboarding and guided setup"
+		"$ENVCTL_BINARY" onboard \
+			--config "$ENV_CONFIG_CHECKOUT" \
+			--setup
 		return
 	fi
-	printf '\nRun onboarding from an interactive terminal:\n'
-	printf '  %q onboard --config %q\n' "$ENVCTL_BINARY" "$ENV_CONFIG_CHECKOUT"
+	printf '\nRun onboarding and setup from an interactive terminal:\n'
+	printf '  %q onboard --config %q --setup\n' \
+		"$ENVCTL_BINARY" "$ENV_CONFIG_CHECKOUT"
 }
 
 main() {
@@ -244,17 +262,20 @@ main() {
 		"$ENV_CONFIG_PRIVATE_REPO" \
 		"$ENV_CONFIG_PRIVATE_REF" \
 		"$ENV_CONFIG_CHECKOUT" \
-		"$deploy_ssh"
+		"$deploy_ssh" \
+		true
 	build_envctl
 	verify_foundation
-	launch_onboarding
+	launch_guided_setup
 
-	printf '\nBootstrap foundation complete.\n'
+	printf '\nBootstrap command complete.\n'
 	printf 'envctl:    %s\n' "$ENVCTL_BINARY"
 	printf 'code:      %s\n' "$ENVCTL_CHECKOUT"
 	printf 'config:    %s\n' "$ENV_CONFIG_CHECKOUT"
 	printf 'inventory: %s\n' "$BOOTSTRAP_STATE/initial-audit.json"
-	printf '\nNo desired package or link state was applied automatically.\n'
+	printf '\nDesired-state changes were made only through confirmed setup phases.\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	main "$@"
+fi

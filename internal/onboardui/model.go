@@ -35,14 +35,18 @@ type machineWrittenMsg struct {
 }
 
 type Model struct {
-	result        onboard.Result
-	configRoot    string
-	writer        MachineWriter
-	profileCursor int
-	confirming    bool
-	written       bool
-	width         int
-	statusMessage string
+	result             onboard.Result
+	configRoot         string
+	writer             MachineWriter
+	profileCursor      int
+	confirming         bool
+	written            bool
+	continueAfterWrite bool
+	editingMachineID   bool
+	machineIDDraft     string
+	machineIDFresh     bool
+	width              int
+	statusMessage      string
 }
 
 func New(
@@ -50,9 +54,27 @@ func New(
 	configRoot string,
 	writer MachineWriter,
 ) *Model {
-	return &Model{
+	model := &Model{
 		result: result, configRoot: configRoot, writer: writer, width: 90,
 	}
+	if result.Status == onboard.StatusUnmatched && result.Proposal != nil {
+		model.editingMachineID = true
+		model.machineIDDraft = result.Proposal.ID
+		model.machineIDFresh = true
+	}
+	return model
+}
+
+func (m *Model) ContinueIntoSetup() *Model {
+	m.continueAfterWrite = true
+	return m
+}
+
+func (m *Model) WrittenMachineID() string {
+	if !m.written || m.result.Proposal == nil {
+		return ""
+	}
+	return m.result.Proposal.ID
 }
 
 func Run(model *Model) error {
@@ -69,8 +91,14 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = message.Width
 	case tea.KeyPressMsg:
+		if message.String() == "ctrl+c" {
+			return m, tea.Quit
+		}
+		if m.editingMachineID {
+			return m.updateMachineID(message)
+		}
 		switch message.String() {
-		case "q", "ctrl+c":
+		case "q":
 			return m, tea.Quit
 		case "down", "j":
 			m.moveProfile(1)
@@ -78,6 +106,8 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.moveProfile(-1)
 		case "space":
 			m.toggleProfile()
+		case "e":
+			m.beginMachineIDEdit()
 		case "w":
 			m.requestWrite()
 		case "n", "esc":
@@ -99,6 +129,11 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.written = true
 		m.statusMessage = "Wrote " + message.path + ".\n" +
 			"Review the Git diff, then rerun onboard to preview this machine."
+		if m.continueAfterWrite {
+			m.statusMessage = "Registered " + m.result.Proposal.ID +
+				"; continuing into guided setup."
+			return m, tea.Quit
+		}
 	}
 	return m, nil
 }
@@ -212,11 +247,24 @@ func (m *Model) View() tea.View {
 		}
 	} else if m.result.Proposal != nil {
 		body.WriteString(fmt.Sprintf(
-			"Proposed file: %s\nMachine ID: %s\nAccess from fleet controller: %s",
+			"Proposed file: %s\nMachine ID: ",
 			m.result.ProposalPath,
-			m.result.Proposal.ID,
-			m.result.Proposal.Access.Type,
 		))
+		if m.editingMachineID {
+			draft := m.machineIDDraft
+			if draft == "" {
+				draft = " "
+			}
+			body.WriteString(highlightStyle.Render(draft + " "))
+			body.WriteString(mutedStyle.Render("  enter to accept"))
+		} else {
+			body.WriteString(m.result.Proposal.ID)
+			if m.result.Status == onboard.StatusUnmatched {
+				body.WriteString(mutedStyle.Render("  e to edit"))
+			}
+		}
+		body.WriteString("\nAccess from fleet controller: ")
+		body.WriteString(m.result.Proposal.Access.Type)
 		if m.result.Proposal.Access.Host != "" {
 			body.WriteString(" (" + m.result.Proposal.Access.Host + ")")
 		}
@@ -265,9 +313,13 @@ func (m *Model) View() tea.View {
 		body.WriteString("\n")
 	}
 	body.WriteString("\n")
-	if m.result.Status == onboard.StatusUnmatched {
+	if m.editingMachineID {
 		body.WriteString(mutedStyle.Render(
-			"j/k profile   space toggle   w write   q quit",
+			"type machine ID   enter accept   esc keep suggestion   ctrl+c quit",
+		))
+	} else if m.result.Status == onboard.StatusUnmatched {
+		body.WriteString(mutedStyle.Render(
+			"e edit ID   j/k profile   space toggle   w write   q quit",
 		))
 	} else if m.result.Status == onboard.StatusNeedsConfirmation {
 		body.WriteString(mutedStyle.Render("w write   q quit"))
@@ -279,6 +331,71 @@ func (m *Model) View() tea.View {
 	view.AltScreen = true
 	view.WindowTitle = "envctl onboard"
 	return view
+}
+
+func (m *Model) beginMachineIDEdit() {
+	if m.result.Status != onboard.StatusUnmatched || m.result.Proposal == nil {
+		return
+	}
+	m.editingMachineID = true
+	m.machineIDDraft = m.result.Proposal.ID
+	m.machineIDFresh = true
+	m.statusMessage = ""
+}
+
+func (m *Model) updateMachineID(
+	message tea.KeyPressMsg,
+) (tea.Model, tea.Cmd) {
+	switch message.String() {
+	case "enter":
+		candidate := strings.TrimSpace(m.machineIDDraft)
+		if !onboard.SafeIdentifier(candidate) {
+			m.statusMessage = "Use letters, numbers, dots, underscores, or hyphens."
+			return m, nil
+		}
+		if contains(m.result.ConfiguredMachines, candidate) &&
+			candidate != m.result.Proposal.ID {
+			m.statusMessage = "Machine ID already exists: " + candidate
+			return m, nil
+		}
+		previous := m.result.Proposal.ID
+		m.result.Proposal.ID = candidate
+		m.result.ProposalPath = "machines/" + candidate + ".yaml"
+		if m.result.Proposal.Access.Type == "ssh" &&
+			(m.result.Proposal.Access.Host == "" ||
+				m.result.Proposal.Access.Host == previous) {
+			m.result.Proposal.Access.Host = candidate
+		}
+		m.machineIDDraft = candidate
+		m.machineIDFresh = false
+		m.editingMachineID = false
+		m.statusMessage = ""
+	case "esc":
+		m.machineIDDraft = m.result.Proposal.ID
+		m.machineIDFresh = false
+		m.editingMachineID = false
+		m.statusMessage = ""
+	case "backspace", "ctrl+h":
+		if m.machineIDFresh {
+			m.machineIDDraft = ""
+			m.machineIDFresh = false
+			break
+		}
+		runes := []rune(m.machineIDDraft)
+		if len(runes) > 0 {
+			m.machineIDDraft = string(runes[:len(runes)-1])
+		}
+	default:
+		if message.Text == "" {
+			return m, nil
+		}
+		if m.machineIDFresh {
+			m.machineIDDraft = ""
+			m.machineIDFresh = false
+		}
+		m.machineIDDraft += message.Text
+	}
+	return m, nil
 }
 
 func (m *Model) moveProfile(delta int) {

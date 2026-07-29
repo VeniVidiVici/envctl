@@ -68,6 +68,7 @@ func TestNewMachineRequiresProfile(t *testing.T) {
 		AvailableProfiles: []string{"shared", "laptop"},
 	}, "/config", &fakeWriter{})
 
+	model.Update(keyMessage("enter"))
 	model.Update(keyMessage("w"))
 	if model.confirming || !strings.Contains(model.statusMessage, "at least one") {
 		t.Fatalf("model = %#v", model)
@@ -77,6 +78,59 @@ func TestNewMachineRequiresProfile(t *testing.T) {
 	if !model.confirming ||
 		strings.Join(model.result.Proposal.Profiles, ",") != "shared" {
 		t.Fatalf("model = %#v", model)
+	}
+}
+
+func TestNewMachineCanReplaceSuggestedID(t *testing.T) {
+	model := New(onboard.Result{
+		Status: onboard.StatusUnmatched,
+		Proposal: &envconfig.Machine{
+			ID: "chriss-macbook-air",
+			Access: envconfig.Access{
+				Type: "ssh",
+				Host: "chriss-macbook-air",
+			},
+		},
+		ProposalPath: "machines/chriss-macbook-air.yaml",
+	}, "/config", &fakeWriter{})
+
+	model.Update(keyMessage("macbook-air"))
+	model.Update(keyMessage("enter"))
+
+	if model.editingMachineID {
+		t.Fatal("machine ID editor is still active")
+	}
+	if model.result.Proposal.ID != "macbook-air" ||
+		model.result.Proposal.Access.Host != "macbook-air" ||
+		model.result.ProposalPath != "machines/macbook-air.yaml" {
+		t.Fatalf("proposal = %#v", model.result.Proposal)
+	}
+}
+
+func TestContinueIntoSetupQuitsAfterWrite(t *testing.T) {
+	writer := &fakeWriter{path: "machines/new-mac.yaml"}
+	model := New(onboard.Result{
+		Status: onboard.StatusUnmatched,
+		Proposal: &envconfig.Machine{
+			ID:       "new-mac",
+			Profiles: []string{"shared"},
+			Access:   envconfig.Access{Type: "ssh", Host: "new-mac"},
+		},
+		AvailableProfiles: []string{"shared"},
+	}, "/config", writer).ContinueIntoSetup()
+
+	model.Update(keyMessage("enter"))
+	model.Update(keyMessage("w"))
+	_, writeCommand := model.Update(keyMessage("y"))
+	if writeCommand == nil {
+		t.Fatal("confirmation produced no write command")
+	}
+	_, quitCommand := model.Update(writeCommand())
+	if quitCommand == nil {
+		t.Fatal("successful write did not quit onboarding")
+	}
+	if model.WrittenMachineID() != "new-mac" {
+		t.Fatalf("written machine = %q", model.WrittenMachineID())
 	}
 }
 
