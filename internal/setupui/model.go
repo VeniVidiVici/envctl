@@ -261,7 +261,9 @@ func (m *Model) View() tea.View {
 	}
 	if m.running {
 		body.WriteString("\n")
-		body.WriteString(warningStyle.Render("Phase is running…"))
+		body.WriteString(warningStyle.Render(
+			"Phase is running… larger installs can take several minutes.",
+		))
 		body.WriteString("\n")
 	}
 	if m.statusMessage != "" {
@@ -335,6 +337,11 @@ func (m *Model) runSelected() tea.Cmd {
 	m.running = true
 	m.statusMessage = ""
 	id := phase.ID
+	if m.automatic {
+		return func() tea.Msg {
+			return phaseFinishedMsg{id: id, err: command.Run()}
+		}
+	}
 	return tea.ExecProcess(command, func(err error) tea.Msg {
 		return phaseFinishedMsg{id: id, err: err}
 	})
