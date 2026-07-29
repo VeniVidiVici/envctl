@@ -154,6 +154,7 @@ sync_checkout() {
 		if [[ -n "$ssh_command" ]]; then
 			GIT_SSH_COMMAND="$ssh_command" \
 				git clone --branch "$ref" --single-branch "$repository" "$checkout"
+			git -C "$checkout" config --local core.sshCommand "$ssh_command"
 		else
 			git clone --branch "$ref" --single-branch "$repository" "$checkout"
 		fi
@@ -164,6 +165,9 @@ sync_checkout() {
 		fail "checkout origin does not match $repository: $checkout"
 	[[ "$(git -C "$checkout" branch --show-current)" == "$ref" ]] ||
 		fail "checkout is not on expected branch $ref: $checkout"
+	if [[ -n "$ssh_command" ]]; then
+		git -C "$checkout" config --local core.sshCommand "$ssh_command"
+	fi
 
 	local local_changes
 	local_changes="$(git -C "$checkout" status --porcelain)"

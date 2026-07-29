@@ -233,6 +233,63 @@ func TestBootstrapPreservesOnboardingChangesAcrossFastForward(t *testing.T) {
 	}
 }
 
+func TestBootstrapPersistsPrivateCheckoutSSHCommand(t *testing.T) {
+	root := t.TempDir()
+	remote := filepath.Join(root, "remote.git")
+	seed := filepath.Join(root, "seed")
+	checkout := filepath.Join(root, "checkout")
+	runGit(t, root, "init", "--bare", remote)
+	runGit(t, root, "init", "-b", "main", seed)
+	if err := os.WriteFile(
+		filepath.Join(seed, "README.md"),
+		[]byte("initial\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, seed, "add", "README.md")
+	runGit(t, seed, "commit", "-m", "initial")
+	runGit(t, seed, "remote", "add", "origin", remote)
+	runGit(t, seed, "push", "-u", "origin", "main")
+
+	scriptPath, err := filepath.Abs(
+		filepath.Join("..", "..", "scripts", "bootstrap-macos"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sshCommand := "ssh -i /tmp/env-config-deploy -o IdentitiesOnly=yes"
+	command := exec.Command(
+		"/bin/bash",
+		"-c",
+		`source "$1"; sync_checkout "$2" main "$3" "$4"`,
+		"bootstrap-test",
+		scriptPath,
+		remote,
+		checkout,
+		sshCommand,
+	)
+	command.Env = append(os.Environ(), "HOME="+filepath.Join(root, "home"))
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("clone private checkout: %v\n%s", err, output)
+	}
+	output, err := exec.Command(
+		"git",
+		"-C",
+		checkout,
+		"config",
+		"--local",
+		"--get",
+		"core.sshCommand",
+	).CombinedOutput()
+	if err != nil {
+		t.Fatalf("read checkout SSH command: %v\n%s", err, output)
+	}
+	if actual := strings.TrimSpace(string(output)); actual != sshCommand {
+		t.Fatalf("core.sshCommand = %q, want %q", actual, sshCommand)
+	}
+}
+
 func readBootstrapScript(t *testing.T) string {
 	t.Helper()
 	scriptPath := filepath.Join("..", "..", "scripts", "bootstrap-macos")
