@@ -264,6 +264,27 @@ access:
 	}
 }
 
+func TestValidateLinkTargetAllowsOnlyNonSecretGPGConfiguration(t *testing.T) {
+	for _, target := range []string{
+		"~/.gnupg/dirmngr.conf",
+		"~/.gnupg/gpg-agent.conf",
+		"~/.gnupg/gpg.conf",
+	} {
+		if err := validateLinkTarget(target); err != nil {
+			t.Fatalf("validateLinkTarget(%q) error = %v", target, err)
+		}
+	}
+	for _, target := range []string{
+		"~/.gnupg/private-keys-v1.d/key.key",
+		"~/.gnupg/pubring.kbx",
+		"~/.gnupg/trustdb.gpg",
+	} {
+		if err := validateLinkTarget(target); err == nil {
+			t.Fatalf("validateLinkTarget(%q) error = nil, want rejection", target)
+		}
+	}
+}
+
 func TestLoadResolvesRecoverySourcesAndTargets(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

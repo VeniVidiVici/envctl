@@ -39,6 +39,46 @@ func TestUnknownCommand(t *testing.T) {
 	}
 }
 
+func TestLegacyAuditUsesSafeDefaults(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	root := filepath.Join(
+		home, ".local", "share", "envctl", "repos", "env-config",
+	)
+	writeMainTestFile(t, filepath.Join(root, "envctl.yaml"), `
+version: 1
+catalog: catalog/packages.yaml
+profiles: profiles
+machines: machines
+`)
+	writeMainTestFile(
+		t,
+		filepath.Join(root, "portable", "shell", ".zshrc"),
+		"export LEGACY_ENV_HOME=\"$HOME/Documents/env\"\n",
+	)
+
+	var stdout, stderr bytes.Buffer
+	err := run(
+		context.Background(),
+		[]string{"legacy", "audit", "--json"},
+		&stdout,
+		&stderr,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report struct {
+		Dependencies int  `json:"dependencies"`
+		Ready        bool `json:"ready"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Ready || report.Dependencies != 1 {
+		t.Fatalf("report = %#v", report)
+	}
+}
+
 func TestLocalSetupCommandBuildsScopedVerifiedApply(t *testing.T) {
 	got := localSetupCommand(
 		"apply", "", "/config", "machine", model.ManagerMise, true,

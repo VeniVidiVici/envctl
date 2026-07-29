@@ -158,14 +158,15 @@ envctl update
 ```
 
 `envctl rebuild` installs the current checkout without pulling, which is useful
-while developing envctl. Both commands discover the bootstrap checkout or
-`~/Documents/envctl`; `--source DIR` and `ENVCTL_SOURCE` remain available for
-unusual layouts.
+while developing envctl. Both commands discover the canonical bootstrap
+checkout under `~/.local/share/envctl/repos`; `--source DIR` and
+`ENVCTL_SOURCE` remain available for unusual layouts.
 
 ## Current commands
 
 ```sh
 go run ./cmd/envctl audit --json
+go run ./cmd/envctl legacy audit --json
 go run ./cmd/envctl setup \
   --config ../env-config --machine example-mac --local
 go run ./cmd/envctl import-legacy --input ../env/apps-config.json
@@ -279,11 +280,18 @@ Audits and plans are recorded in `~/.local/state/envctl/state.db` by default.
 Use `--no-record` for an entirely ephemeral run or `--state PATH` to select a
 different database.
 
-`envctl tui` discovers the bootstrap config checkout first, then
-`~/Documents/env-config`; it uses `~/.local/state/envctl/inventory`, identifies
-the current Mac from its registered hardware fingerprint, and refreshes that
-Mac's inventory on entry. `ENVCTL_CONFIG` and `ENVCTL_INVENTORY_DIR` override
-the defaults, while the existing flags remain available for unusual layouts.
+`envctl legacy audit` uses the canonical config checkout and checks active
+configuration links, selected machine-local configuration files,
+LaunchAgents, and portable sources for references to `~/Documents/env`. It
+prints a compact human report by default and exposes the complete finding set
+with `--json`.
+
+`envctl tui` discovers the canonical bootstrap config checkout under
+`~/.local/share/envctl/repos`; it uses `~/.local/state/envctl/inventory`,
+identifies the current Mac from its registered hardware fingerprint, and
+refreshes that Mac's inventory on entry. `ENVCTL_CONFIG` and
+`ENVCTL_INVENTORY_DIR` override the defaults, while the existing flags remain
+available for unusual layouts.
 
 The fleet TUI highlights installed packages that are absent from desired state
 as `EXTRA`; press `e` to show only those findings. Press `a` to review an item

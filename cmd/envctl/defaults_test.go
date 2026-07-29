@@ -10,21 +10,21 @@ import (
 	"github.com/VeniVidiVici/envctl/internal/onboard"
 )
 
-func TestResolveConfigRootPrefersBootstrapCheckoutThenDocuments(t *testing.T) {
+func TestResolveConfigRootUsesCanonicalBootstrapCheckout(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv(configEnvironment, "")
+	t.Chdir(t.TempDir())
 	bootstrap := filepath.Join(
 		home, ".local", "share", "envctl", "repos", "env-config",
 	)
 	documents := filepath.Join(home, "Documents", "env-config")
 	writeRootMarker(t, documents)
-	got, err := resolveConfigRoot("")
-	if err != nil || got != documents {
-		t.Fatalf("resolveConfigRoot() = %q, %v; want %q", got, err, documents)
+	if got, err := resolveConfigRoot(""); err == nil {
+		t.Fatalf("resolveConfigRoot() = %q, nil; want Documents checkout ignored", got)
 	}
 	writeRootMarker(t, bootstrap)
-	got, err = resolveConfigRoot("")
+	got, err := resolveConfigRoot("")
 	if err != nil || got != bootstrap {
 		t.Fatalf("resolveConfigRoot() = %q, %v; want %q", got, err, bootstrap)
 	}

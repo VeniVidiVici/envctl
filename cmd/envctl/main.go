@@ -26,6 +26,7 @@ import (
 	"github.com/VeniVidiVici/envctl/internal/fleetui"
 	"github.com/VeniVidiVici/envctl/internal/homebrew"
 	"github.com/VeniVidiVici/envctl/internal/legacy"
+	"github.com/VeniVidiVici/envctl/internal/legacydeps"
 	"github.com/VeniVidiVici/envctl/internal/mas"
 	"github.com/VeniVidiVici/envctl/internal/mise"
 	"github.com/VeniVidiVici/envctl/internal/model"
@@ -48,6 +49,7 @@ Usage:
   envctl onboard --config DIR [--json] [--machine ID] [--profiles A,B] [--setup] [--auto]
   envctl setup --config DIR --machine ID --local [--json] [--auto]
   envctl import-legacy --input PATH
+  envctl legacy audit [--config DIR] [--root PATH] [--json]
   envctl config validate --config DIR --json
   envctl config resolve --config DIR --machine ID --json
   envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
@@ -90,6 +92,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runSetup(ctx, args[1:], stdout, stderr)
 	case "import-legacy":
 		return runImportLegacy(args[1:], stdout, stderr)
+	case "legacy":
+		return runLegacyCommand(args[1:], stdout, stderr)
 	case "plan":
 		return runPlan(ctx, args[1:], stdout, stderr)
 	case "apply":
@@ -116,6 +120,69 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], usage)
 	}
+}
+
+func runLegacyCommand(args []string, stdout, stderr io.Writer) error {
+	if len(args) == 0 || args[0] != "audit" {
+		return errors.New("usage: envctl legacy audit [--config DIR] [--root PATH] [--json]")
+	}
+	flags := flag.NewFlagSet("legacy audit", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	legacyRoot := flags.String("root", "", "legacy environment directory")
+	asJSON := flags.Bool("json", false, "print the audit report as JSON")
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("legacy audit accepts no positional arguments")
+	}
+	resolvedConfig, err := resolveConfigRoot(*configRoot)
+	if err != nil {
+		return err
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return fmt.Errorf("find home directory: %w", err)
+	}
+	resolvedLegacy := *legacyRoot
+	if resolvedLegacy == "" {
+		resolvedLegacy = filepath.Join(home, "Documents", "env")
+	} else {
+		resolvedLegacy, err = expandHome(resolvedLegacy)
+		if err != nil {
+			return err
+		}
+	}
+	auditor, err := legacydeps.New(home, resolvedLegacy, resolvedConfig)
+	if err != nil {
+		return err
+	}
+	report, err := auditor.Audit()
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		return encodeJSON(stdout, report)
+	}
+	if report.Ready {
+		fmt.Fprintf(
+			stdout,
+			"Legacy dependency audit: ready; no active references to %s\n",
+			report.LegacyRoot,
+		)
+		return nil
+	}
+	fmt.Fprintf(
+		stdout,
+		"Legacy dependency audit: %d active reference(s) to %s\n",
+		report.Dependencies,
+		report.LegacyRoot,
+	)
+	for _, finding := range report.Findings {
+		fmt.Fprintf(stdout, "  %s: %s\n", finding.Kind, finding.Path)
+	}
+	return nil
 }
 
 type setupResponse struct {

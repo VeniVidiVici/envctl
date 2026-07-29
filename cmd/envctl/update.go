@@ -115,7 +115,6 @@ func resolveEnvctlSourceRoot(explicit string) (string, error) {
 	}
 	candidates := []string{
 		filepath.Join(home, ".local", "share", "envctl", "repos", "envctl"),
-		filepath.Join(home, "Documents", "envctl"),
 	}
 	if workingDirectory, err := os.Getwd(); err == nil {
 		candidates = append(candidates, workingDirectory)

@@ -31,7 +31,6 @@ func resolveConfigRoot(explicit string) (string, error) {
 	}
 	candidates := []string{
 		filepath.Join(home, ".local", "share", "envctl", "repos", "env-config"),
-		filepath.Join(home, "Documents", "env-config"),
 	}
 	if workingDirectory, err := os.Getwd(); err == nil {
 		candidates = append(candidates,

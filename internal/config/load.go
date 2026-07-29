@@ -709,6 +709,14 @@ func validateLinkTarget(target string) error {
 		strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
 		return fmt.Errorf("escapes or replaces the home directory: %q", target)
 	}
+	allowedGPGConfig := map[string]bool{
+		filepath.Join(".gnupg", "dirmngr.conf"):   true,
+		filepath.Join(".gnupg", "gpg-agent.conf"): true,
+		filepath.Join(".gnupg", "gpg.conf"):       true,
+	}
+	if allowedGPGConfig[cleaned] {
+		return nil
+	}
 	blocked := []string{
 		".cache",
 		filepath.Join(".local", "share"),
