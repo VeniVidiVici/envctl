@@ -46,6 +46,7 @@ type Phase struct {
 	Status       PhaseStatus `json:"status"`
 	Actions      int         `json:"actions"`
 	Blockers     int         `json:"blockers"`
+	Diagnostics  []string    `json:"diagnostics,omitempty"`
 	Dependencies []PhaseID   `json:"dependencies,omitempty"`
 	Command      []string    `json:"command,omitempty"`
 }
@@ -215,6 +216,15 @@ func (m *Model) View() tea.View {
 		body.WriteString("\n")
 		body.WriteString(selected.Description)
 		body.WriteString("\n")
+		if len(selected.Diagnostics) > 0 {
+			body.WriteString(warningStyle.Render("Diagnostics:"))
+			body.WriteString("\n")
+			for _, diagnostic := range selected.Diagnostics {
+				body.WriteString("  - ")
+				body.WriteString(diagnostic)
+				body.WriteString("\n")
+			}
+		}
 		if len(selected.Dependencies) > 0 {
 			body.WriteString(mutedStyle.Render(
 				"Requires: " + joinPhaseIDs(selected.Dependencies),
@@ -272,7 +282,7 @@ func (m *Model) requestRun() tea.Cmd {
 		m.statusMessage = phase.Label + " already needs no action"
 		return nil
 	case StatusBlocked:
-		m.statusMessage = phase.Label + " is blocked; review its diagnostics"
+		m.statusMessage = phase.Label + " is blocked; diagnostics are shown above"
 		return nil
 	case StatusReady:
 		m.confirming = true

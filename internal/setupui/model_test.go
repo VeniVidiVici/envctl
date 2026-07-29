@@ -85,7 +85,9 @@ func TestViewShowsUnifiedSetupState(t *testing.T) {
 		{
 			ID: PhaseRecovery, Label: "Credential recovery",
 			Description: "Restore encrypted local credentials.",
-			Status:      StatusSatisfied,
+			Status:      StatusBlocked,
+			Blockers:    1,
+			Diagnostics: []string{"gpg-keyring (tool-missing): gpg is unavailable"},
 		},
 		{
 			ID: PhaseHomebrew, Label: "Homebrew packages",
@@ -100,6 +102,8 @@ func TestViewShowsUnifiedSetupState(t *testing.T) {
 		"envctl setup",
 		"example-mac",
 		"Credential recovery",
+		"Diagnostics:",
+		"gpg-keyring (tool-missing): gpg is unavailable",
 		"Homebrew packages",
 		"12 action(s)",
 		"j/k move",

@@ -83,7 +83,7 @@ install_prerequisites() {
 	command -v brew >/dev/null 2>&1 || fail "Homebrew is unavailable after installation"
 
 	log "Installing bootstrap prerequisites"
-	brew install age gh git go sops
+	brew install age gh git gnupg go sops
 }
 
 install_age_identity() {

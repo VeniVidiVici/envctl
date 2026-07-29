@@ -31,6 +31,7 @@ func TestBootstrapLaunchesSingleInteractiveSetupFlow(t *testing.T) {
 	script := readBootstrapScript(t)
 	for _, fragment := range []string{
 		"Command Line Tools installation complete; continuing bootstrap",
+		"brew install age gh git gnupg go sops",
 		"Launching interactive onboarding and guided setup",
 		`"$ENVCTL_BINARY" onboard \`,
 		`--setup`,
