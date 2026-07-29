@@ -22,6 +22,24 @@ func (f *fakeCommandFactory) Command(phase Phase) (*exec.Cmd, error) {
 	return exec.CommandContext(context.Background(), "true"), nil
 }
 
+func TestProcessFactoryLeavesTerminalStreamsForExecProcess(t *testing.T) {
+	command, err := (ProcessFactory{
+		Context:    context.Background(),
+		Executable: "true",
+	}).Command(Phase{Command: []string{"--version"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if command.Stdin != nil || command.Stdout != nil || command.Stderr != nil {
+		t.Fatalf(
+			"process streams = stdin %v stdout %v stderr %v, want all nil",
+			command.Stdin,
+			command.Stdout,
+			command.Stderr,
+		)
+	}
+}
+
 func TestModelEnforcesPhaseOrderingAndConfirmation(t *testing.T) {
 	factory := &fakeCommandFactory{}
 	model := New("example-mac", []Phase{
@@ -93,14 +111,26 @@ func TestAutomaticRunsReadyPhasesInOrder(t *testing.T) {
 			Dependencies: []PhaseID{PhaseRecovery},
 			Command:      []string{"links"},
 		},
-	}, factory).Automatic()
+	}, factory)
+	launches := 0
+	model.launchProcess = func(
+		command *exec.Cmd,
+		callback tea.ExecCallback,
+	) tea.Cmd {
+		launches++
+		return func() tea.Msg {
+			return callback(command.Run())
+		}
+	}
+	model.Automatic()
 
 	command := model.Init()
 	if command == nil || !model.running ||
-		factory.phase.ID != PhaseRecovery || model.confirming {
+		factory.phase.ID != PhaseRecovery || model.confirming ||
+		launches != 1 {
 		t.Fatalf(
-			"initial automatic phase = command %v model %#v factory %#v",
-			command, model, factory,
+			"initial automatic phase = command %v model %#v factory %#v launches %d",
+			command, model, factory, launches,
 		)
 	}
 	finished, ok := command().(phaseFinishedMsg)
@@ -110,10 +140,11 @@ func TestAutomaticRunsReadyPhasesInOrder(t *testing.T) {
 	_, command = model.Update(finished)
 	if command == nil || !model.running ||
 		factory.phase.ID != PhaseLinks ||
-		model.phases[0].Status != StatusCompleted {
+		model.phases[0].Status != StatusCompleted ||
+		launches != 2 {
 		t.Fatalf(
-			"second automatic phase = command %v model %#v factory %#v",
-			command, model, factory,
+			"second automatic phase = command %v model %#v factory %#v launches %d",
+			command, model, factory, launches,
 		)
 	}
 	finished, ok = command().(phaseFinishedMsg)

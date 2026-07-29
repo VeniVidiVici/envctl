@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
-	"os"
 	"os/exec"
 	"strings"
 
@@ -71,9 +69,8 @@ func (f ProcessFactory) Command(phase Phase) (*exec.Cmd, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	// ExecProcess attaches all three streams after releasing the TUI's terminal.
 	command := exec.CommandContext(ctx, f.Executable, phase.Command...)
-	command.Stdout = io.Discard
-	command.Stderr = os.Stderr
 	return command, nil
 }
 
@@ -86,6 +83,7 @@ type Model struct {
 	machineID     string
 	phases        []Phase
 	factory       CommandFactory
+	launchProcess func(*exec.Cmd, tea.ExecCallback) tea.Cmd
 	cursor        int
 	confirming    bool
 	running       bool
@@ -96,10 +94,11 @@ type Model struct {
 
 func New(machineID string, phases []Phase, factory CommandFactory) *Model {
 	return &Model{
-		machineID: machineID,
-		phases:    append([]Phase(nil), phases...),
-		factory:   factory,
-		width:     96,
+		machineID:     machineID,
+		phases:        append([]Phase(nil), phases...),
+		factory:       factory,
+		launchProcess: tea.ExecProcess,
+		width:         96,
 	}
 }
 
@@ -337,12 +336,12 @@ func (m *Model) runSelected() tea.Cmd {
 	m.running = true
 	m.statusMessage = ""
 	id := phase.ID
-	if m.automatic {
-		return func() tea.Msg {
-			return phaseFinishedMsg{id: id, err: command.Run()}
-		}
+	if m.launchProcess == nil {
+		m.running = false
+		m.statusMessage = "Setup process handoff is unavailable"
+		return nil
 	}
-	return tea.ExecProcess(command, func(err error) tea.Msg {
+	return m.launchProcess(command, func(err error) tea.Msg {
 		return phaseFinishedMsg{id: id, err: err}
 	})
 }
