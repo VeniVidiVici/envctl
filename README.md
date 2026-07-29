@@ -54,10 +54,10 @@ machine; it cannot be used to bypass machine selection.
 The clean-Mac bootstrap adds `--auto`. That mode runs executable phases in
 dependency order without asking for a separate confirmation for each phase.
 It stops on the first blocker or failure, and review-only or explicitly manual
-items retain their existing safety boundaries. When Homebrew work is pending,
-automatic setup requests sudo authorization once before entering the
-full-screen interface and refreshes that authorization while package
-installation is running:
+items retain their existing safety boundaries. While an executable phase is
+running, setup releases the full-screen interface and gives the package manager
+the ordinary terminal, including interactive password prompts. The setup view
+resumes after the phase finishes:
 
 ```sh
 envctl onboard --config /path/to/env-config --setup --auto

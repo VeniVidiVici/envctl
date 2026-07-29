@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -46,6 +47,8 @@ func (ExecRunner) Run(
 ) (string, string, error) {
 	command := exec.CommandContext(ctx, name, args...)
 	var stdout, stderr bytes.Buffer
+	// Validated local installers may still need the controlling terminal.
+	command.Stdin = os.Stdin
 	command.Stdout = &stdout
 	command.Stderr = &stderr
 	err := command.Run()
