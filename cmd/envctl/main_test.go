@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/VeniVidiVici/envctl/internal/executor"
 	"github.com/VeniVidiVici/envctl/internal/model"
 	"github.com/VeniVidiVici/envctl/internal/onboard"
 	"github.com/VeniVidiVici/envctl/internal/portablelink"
@@ -47,10 +48,39 @@ func TestLocalSetupCommandBuildsScopedVerifiedApply(t *testing.T) {
 		"--local",
 		"--manager", "mise",
 		"--yes",
+		"--setup-progress",
 		"--json",
 	}
 	if strings.Join(got, "\x00") != strings.Join(want, "\x00") {
 		t.Fatalf("command = %#v, want %#v", got, want)
+	}
+}
+
+func TestSetupApplySummaryIsCompactAndHumanReadable(t *testing.T) {
+	var output bytes.Buffer
+	err := writeSetupApplySummary(&output, applyResponse{
+		Mode:     "apply",
+		Manager:  model.ManagerBrew,
+		Verified: true,
+		Execution: executor.Report{Results: []executor.Result{{
+			Status: executor.StatusCompleted,
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, expected := range []string{
+		"Homebrew packages",
+		"verified",
+		"1 install(s) completed",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("summary does not contain %q: %q", expected, got)
+		}
+	}
+	if strings.Contains(got, `"findings"`) {
+		t.Fatalf("summary contains machine JSON: %q", got)
 	}
 }
 

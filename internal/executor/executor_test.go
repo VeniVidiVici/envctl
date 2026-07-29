@@ -1,13 +1,40 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/VeniVidiVici/envctl/internal/model"
 )
+
+func TestExecRunnerStreamsLabelledProgressAndStillCapturesOutput(t *testing.T) {
+	var progress bytes.Buffer
+	stdout, stderr, err := (ExecRunner{Progress: &progress}).Run(
+		context.Background(),
+		"/bin/sh",
+		"-c",
+		"printf 'downloaded\\n'; printf 'installer notice\\n' >&2",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "downloaded\n" || stderr != "installer notice\n" {
+		t.Fatalf("captured stdout = %q, stderr = %q", stdout, stderr)
+	}
+	for _, expected := range []string{
+		"==> Running /bin/sh -c",
+		"downloaded",
+		"installer notice",
+	} {
+		if !strings.Contains(progress.String(), expected) {
+			t.Fatalf("progress does not contain %q:\n%s", expected, progress.String())
+		}
+	}
+}
 
 func TestPlanBuildsExactHomebrewCommands(t *testing.T) {
 	tests := []struct {

@@ -22,7 +22,7 @@ func (f *fakeCommandFactory) Command(phase Phase) (*exec.Cmd, error) {
 	return exec.CommandContext(context.Background(), "true"), nil
 }
 
-func TestProcessFactoryLeavesTerminalStreamsForExecProcess(t *testing.T) {
+func TestProcessFactoryKeepsMachineJSONOutOfTerminal(t *testing.T) {
 	command, err := (ProcessFactory{
 		Context:    context.Background(),
 		Executable: "true",
@@ -30,9 +30,9 @@ func TestProcessFactoryLeavesTerminalStreamsForExecProcess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if command.Stdin != nil || command.Stdout != nil || command.Stderr != nil {
+	if command.Stdin != nil || command.Stdout == nil || command.Stderr != nil {
 		t.Fatalf(
-			"process streams = stdin %v stdout %v stderr %v, want all nil",
+			"process streams = stdin %v stdout %v stderr %v",
 			command.Stdin,
 			command.Stdout,
 			command.Stderr,
@@ -156,6 +156,35 @@ func TestAutomaticRunsReadyPhasesInOrder(t *testing.T) {
 		model.phases[1].Status != StatusCompleted ||
 		!strings.Contains(model.statusMessage, "completed") {
 		t.Fatalf("automatic completion = command %v model %#v", command, model)
+	}
+	if model.cursor != len(model.phases)-1 {
+		t.Fatalf("completion cursor = %d, want %d", model.cursor, len(model.phases)-1)
+	}
+	if content := model.View().Content; !strings.Contains(
+		content, "Automatic setup completed",
+	) {
+		t.Fatalf("completion view = %q", content)
+	}
+}
+
+func TestViewClampsCursorPastFinalPhase(t *testing.T) {
+	model := New("example-mac", []Phase{{
+		ID: PhaseMAS, Label: "Mac App Store",
+		Description: "Review App Store applications.",
+		Status:      StatusReviewed,
+	}}, &fakeCommandFactory{})
+	model.cursor = len(model.phases)
+	model.statusMessage = "Automatic setup completed"
+
+	content := model.View().Content
+	for _, expected := range []string{
+		"Mac App Store",
+		"Review App Store applications.",
+		"Automatic setup completed",
+	} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("completion view does not contain %q:\n%s", expected, content)
+		}
 	}
 }
 

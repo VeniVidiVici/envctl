@@ -505,6 +505,9 @@ func localSetupCommand(
 	} else {
 		arguments = append(arguments, "--dry-run")
 	}
+	if command == "apply" {
+		arguments = append(arguments, "--setup-progress")
+	}
 	return append(arguments, "--json")
 }
 
@@ -1406,6 +1409,11 @@ func runApply(
 	dryRun := flags.Bool("dry-run", false, "validate and print commands without changing state")
 	yes := flags.Bool("yes", false, "confirm execution of the validated plan")
 	asJSON := flags.Bool("json", false, "print the apply report as JSON")
+	setupProgress := flags.Bool(
+		"setup-progress",
+		false,
+		"stream concise installer progress for guided setup",
+	)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -1415,12 +1423,18 @@ func runApply(
 	if !*asJSON {
 		return errors.New("apply currently requires --json")
 	}
+	if *setupProgress && !*localMachine {
+		return errors.New("--setup-progress requires --local")
+	}
 	if *dryRun == *yes {
 		return errors.New("exactly one of --dry-run or --yes is required")
 	}
 	selectedManager, err := parseApplyManager(*managerName)
 	if err != nil {
 		return err
+	}
+	if *setupProgress {
+		fmt.Fprintf(stderr, "\n==> %s\n", applyManagerLabel(selectedManager))
 	}
 	if selectedManager == model.ManagerMAS && *yes {
 		return errors.New(
@@ -1459,7 +1473,7 @@ func runApply(
 		beforePlan.Actions, selectedManager,
 	)
 	if selectedManager == model.ManagerMAS {
-		actionRunner, err := executionRunnerFor(loaded)
+		actionRunner, err := executionRunnerFor(loaded, nil)
 		if err != nil {
 			return err
 		}
@@ -1489,7 +1503,9 @@ func runApply(
 			Ready:           false,
 			Verified:        len(selectedActions) == 0,
 		}
-		return encodeJSON(stdout, response)
+		return writeApplyResponse(
+			stdout, stderr, response, *setupProgress,
+		)
 	}
 	commands, blockedActions := classifyActions(selectedActions)
 	mode := "dry-run"
@@ -1510,7 +1526,9 @@ func runApply(
 		Verified:        len(selectedActions) == 0,
 	}
 	if *dryRun {
-		return encodeJSON(stdout, response)
+		return writeApplyResponse(
+			stdout, stderr, response, *setupProgress,
+		)
 	}
 	if len(blockedActions) > 0 {
 		return fmt.Errorf(
@@ -1519,7 +1537,9 @@ func runApply(
 		)
 	}
 	if len(commands) == 0 {
-		return encodeJSON(stdout, response)
+		return writeApplyResponse(
+			stdout, stderr, response, *setupProgress,
+		)
 	}
 
 	reloaded, err := envconfig.Load(*configRoot, *machineID)
@@ -1534,7 +1554,11 @@ func runApply(
 	if reloaded.Digest != loaded.Digest {
 		return errors.New("configuration changed during planning; rerun apply")
 	}
-	actionRunner, err := executionRunnerFor(reloaded)
+	var progressWriter io.Writer
+	if *setupProgress {
+		progressWriter = stderr
+	}
+	actionRunner, err := executionRunnerFor(reloaded, progressWriter)
 	if err != nil {
 		return err
 	}
@@ -1619,7 +1643,9 @@ func runApply(
 	); err != nil {
 		completionErrors = append(completionErrors, err)
 	}
-	if err := encodeJSON(stdout, response); err != nil {
+	if err := writeApplyResponse(
+		stdout, stderr, response, *setupProgress,
+	); err != nil {
 		completionErrors = append(completionErrors, err)
 	}
 	if applyErr != nil {
@@ -1663,6 +1689,104 @@ func parseApplyManager(value string) (model.Manager, error) {
 		return "", fmt.Errorf(
 			"unsupported --manager %q; expected brew, mise, bun, custom, or mas", value,
 		)
+	}
+}
+
+func writeApplyResponse(
+	stdout, stderr io.Writer,
+	response applyResponse,
+	setupProgress bool,
+) error {
+	if !setupProgress {
+		return encodeJSON(stdout, response)
+	}
+	return writeSetupApplySummary(stderr, response)
+}
+
+func writeSetupApplySummary(
+	writer io.Writer,
+	response applyResponse,
+) error {
+	var summary strings.Builder
+	label := applyManagerLabel(response.Manager)
+	if response.Manager == model.ManagerMAS {
+		if len(response.BlockedActions) == 0 {
+			fmt.Fprintf(&summary, "\n==> %s: already satisfied\n", label)
+		} else {
+			fmt.Fprintf(
+				&summary,
+				"\n==> %s: %d app(s) need review\n",
+				label,
+				len(response.BlockedActions),
+			)
+			if response.MASPreflight != nil {
+				for _, app := range response.MASPreflight.Apps {
+					detail := "available for installation from the App Store"
+					if len(app.Blockers) > 0 {
+						detail = app.Blockers[0]
+					}
+					fmt.Fprintf(
+						&summary,
+						"    - %s: %s\n",
+						app.Name,
+						detail,
+					)
+				}
+			}
+			summary.WriteString(
+				"    No Mac App Store apps were installed automatically.\n",
+			)
+		}
+		_, err := io.WriteString(writer, summary.String())
+		return err
+	}
+
+	completed := 0
+	for _, result := range response.Execution.Results {
+		if result.Status == executor.StatusCompleted {
+			completed++
+		}
+	}
+	switch {
+	case response.Verified:
+		fmt.Fprintf(
+			&summary,
+			"\n==> %s: verified (%d install(s) completed)\n",
+			label,
+			completed,
+		)
+	case response.Mode == "dry-run":
+		fmt.Fprintf(
+			&summary,
+			"\n==> %s: %d install(s) ready for review\n",
+			label,
+			len(response.Execution.Commands),
+		)
+	default:
+		fmt.Fprintf(
+			&summary,
+			"\n==> %s: finished, but verification did not pass\n",
+			label,
+		)
+	}
+	_, err := io.WriteString(writer, summary.String())
+	return err
+}
+
+func applyManagerLabel(manager model.Manager) string {
+	switch manager {
+	case model.ManagerBrew:
+		return "Homebrew packages"
+	case model.ManagerMise:
+		return "Mise runtimes"
+	case model.ManagerBun:
+		return "Bun global tools"
+	case model.ManagerCustom:
+		return "Custom tools"
+	case model.ManagerMAS:
+		return "Mac App Store review"
+	default:
+		return "Packages"
 	}
 }
 
@@ -1720,10 +1844,13 @@ func scopedPlan(
 	return scoped
 }
 
-func executionRunnerFor(loaded envconfig.Loaded) (executor.Runner, error) {
+func executionRunnerFor(
+	loaded envconfig.Loaded,
+	progress io.Writer,
+) (executor.Runner, error) {
 	switch loaded.Machine.Access.Type {
 	case "local":
-		return executor.ExecRunner{}, nil
+		return executor.ExecRunner{Progress: progress}, nil
 	case "ssh":
 		runner, err := remoteexec.New(loaded.Machine.Access.Host)
 		if err != nil {
