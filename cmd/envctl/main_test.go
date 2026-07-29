@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/VeniVidiVici/envctl/internal/executor"
+	"github.com/VeniVidiVici/envctl/internal/mas"
 	"github.com/VeniVidiVici/envctl/internal/model"
 	"github.com/VeniVidiVici/envctl/internal/onboard"
 	"github.com/VeniVidiVici/envctl/internal/portablelink"
@@ -81,6 +83,95 @@ func TestSetupApplySummaryIsCompactAndHumanReadable(t *testing.T) {
 	}
 	if strings.Contains(got, `"findings"`) {
 		t.Fatalf("summary contains machine JSON: %q", got)
+	}
+}
+
+func TestMASApplyContinuesWhenPaidAppIsNotOwned(t *testing.T) {
+	runner := &mainTestRunner{
+		results: []mainTestRunResult{
+			{stdout: "Installed Free App\n"},
+			{stderr: "This redownload is not available", err: errors.New("exit 1")},
+		},
+	}
+	journal := &mainTestJournal{}
+	installations := []mas.Installation{
+		{
+			Action: model.Action{
+				Sequence: 1, PackageID: "free", Package: "111",
+			},
+			Command: executor.Command{
+				Sequence: 1, PackageID: "free",
+				Name: "mas", Args: []string{"get", "111"},
+			},
+		},
+		{
+			Action: model.Action{
+				Sequence: 2, PackageID: "paid", Package: "222",
+			},
+			Command: executor.Command{
+				Sequence: 2, PackageID: "paid",
+				Name: "mas", Args: []string{"install", "222"},
+			},
+			OwnedOnly: true,
+		},
+	}
+
+	report, completed, blocked, err := applyMASInstallations(
+		context.Background(),
+		runner,
+		journal,
+		installations,
+	)
+	if err != nil {
+		t.Fatalf("applyMASInstallations() error = %v", err)
+	}
+	if len(report.Results) != 2 ||
+		report.Results[0].Status != executor.StatusCompleted ||
+		report.Results[1].Status != executor.StatusSkipped {
+		t.Fatalf("report = %#v", report)
+	}
+	if len(completed) != 1 || completed[0].PackageID != "free" {
+		t.Fatalf("completed = %#v", completed)
+	}
+	if len(blocked) != 1 ||
+		blocked[0].Action.PackageID != "paid" ||
+		!strings.Contains(blocked[0].Reason, "purchase it in the App Store") {
+		t.Fatalf("blocked = %#v", blocked)
+	}
+	if strings.Join(journal.finishes, ",") != "1:completed,2:skipped" {
+		t.Fatalf("journal finishes = %#v", journal.finishes)
+	}
+}
+
+func TestMASSetupSummaryReportsInstalledAndDeferredApps(t *testing.T) {
+	var output bytes.Buffer
+	action := model.Action{PackageID: "paid", Package: "222"}
+	err := writeSetupApplySummary(&output, applyResponse{
+		Mode:    "apply",
+		Manager: model.ManagerMAS,
+		Execution: executor.Report{Results: []executor.Result{{
+			Status: executor.StatusCompleted,
+		}}},
+		BlockedActions: []blockedAction{{
+			Action: action,
+			Reason: "purchase it in the App Store",
+		}},
+		MASPreflight: &mas.PreflightReport{Apps: []mas.AppPreflight{{
+			PackageID: "paid",
+			Name:      "Paid App",
+		}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	for _, expected := range []string{
+		"Mac App Store apps: 1 installed; 1 need manual action",
+		"Paid App: purchase it in the App Store",
+	} {
+		if !strings.Contains(got, expected) {
+			t.Fatalf("summary does not contain %q:\n%s", expected, got)
+		}
 	}
 }
 
@@ -820,7 +911,7 @@ func TestManualSetupPhaseOnlyCountsExplicitManualItems(t *testing.T) {
 	}
 }
 
-func TestMASExecutionIsRefusedBeforeConfigOrSSH(t *testing.T) {
+func TestMASExecutionRequiresLocalMachineBeforeConfigAccess(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	err := run(
 		context.Background(),
@@ -835,9 +926,60 @@ func TestMASExecutionIsRefusedBeforeConfigOrSSH(t *testing.T) {
 		&stdout, &stderr,
 	)
 	if err == nil ||
-		!strings.Contains(err.Error(), "Mac App Store execution is not enabled") {
+		!strings.Contains(err.Error(), "Mac App Store execution requires --local") {
 		t.Fatalf("run(MAS execution) error = %v", err)
 	}
+}
+
+type mainTestRunResult struct {
+	stdout string
+	stderr string
+	err    error
+}
+
+type mainTestRunner struct {
+	results []mainTestRunResult
+	calls   int
+}
+
+func (r *mainTestRunner) Run(
+	_ context.Context,
+	_ string,
+	_ ...string,
+) (string, string, error) {
+	result := r.results[r.calls]
+	r.calls++
+	return result.stdout, result.stderr, result.err
+}
+
+type mainTestJournal struct {
+	starts   []int
+	finishes []string
+}
+
+func (j *mainTestJournal) StartAction(
+	_ context.Context,
+	sequence int,
+) error {
+	j.starts = append(j.starts, sequence)
+	return nil
+}
+
+func (j *mainTestJournal) FinishAction(
+	_ context.Context,
+	sequence int,
+	status, _ string,
+) error {
+	j.finishes = append(j.finishes, fmt.Sprintf("%d:%s", sequence, status))
+	return nil
+}
+
+func (*mainTestJournal) SkipAction(
+	context.Context,
+	int,
+	string,
+) error {
+	return nil
 }
 
 func TestInventoryWarningDistinguishesToolProbeIssue(t *testing.T) {

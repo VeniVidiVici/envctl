@@ -45,13 +45,51 @@ func TestPreflightReportsAvailabilityPriceCompatibilityAndBlockers(t *testing.T)
 	}
 	if !report.Apps[0].Available || !report.Apps[0].Compatible ||
 		!reflect.DeepEqual(report.Apps[0].CandidateCommand,
-			[]string{"sudo", "-n", "mas", "get", "111"}) {
+			[]string{"mas", "get", "111"}) {
 		t.Fatalf("free app = %#v", report.Apps[0])
 	}
-	if report.Apps[1].Compatible || len(report.Apps[1].Blockers) != 2 ||
+	if report.Apps[1].Compatible || !report.Apps[1].RequiresOwnership ||
+		len(report.Apps[1].Blockers) != 1 ||
 		!reflect.DeepEqual(report.Apps[1].CandidateCommand,
-			[]string{"sudo", "-n", "mas", "install", "222"}) {
+			[]string{"mas", "install", "222"}) {
 		t.Fatalf("paid app = %#v", report.Apps[1])
+	}
+}
+
+func TestPreflightAllowsInteractiveFreeAndOwnedOnlyCandidates(t *testing.T) {
+	runner := preflightRunner{responses: map[string][]byte{
+		"mas config --json": []byte(
+			`{"mas":"7.0.0","store":"GB","region":"GB","macos":"26.5 (25F71)"}`,
+		),
+		"mas lookup --json 111": lookupJSON(t, lookupRecord{
+			AdamID: 111, Name: "Free App", FormattedPrice: "Free",
+			MinimumOSVersion: "14.0",
+		}),
+		"mas lookup --json 222": lookupJSON(t, lookupRecord{
+			AdamID: 222, Name: "Paid App", FormattedPrice: "£4.99",
+			Price: 4.99, MinimumOSVersion: "14.0",
+		}),
+	}}
+	actions := []model.Action{
+		{
+			PackageID: "free", Manager: model.ManagerMAS, Kind: model.KindApp,
+			Source: "mac-app-store", Package: "111",
+		},
+		{
+			PackageID: "paid", Manager: model.ManagerMAS, Kind: model.KindApp,
+			Source: "mac-app-store", Package: "222",
+		},
+	}
+
+	report, err := Preflight(context.Background(), actions, runner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !report.Ready || len(report.Blockers) != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	if len(report.Warnings) < 3 {
+		t.Fatalf("warnings = %#v", report.Warnings)
 	}
 }
 
