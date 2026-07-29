@@ -147,10 +147,20 @@ upstream.
 Then launch the fleet review TUI with:
 
 ```sh
-envctl tui \
-  --config ~/Documents/env-config \
-  --inventory-dir ~/.local/state/envctl/migration-20260728
+envctl tui
 ```
+
+To fast-forward the trusted envctl source checkout and atomically install a
+fresh build, run:
+
+```sh
+envctl update
+```
+
+`envctl rebuild` installs the current checkout without pulling, which is useful
+while developing envctl. Both commands discover the bootstrap checkout or
+`~/Documents/envctl`; `--source DIR` and `ENVCTL_SOURCE` remain available for
+unusual layouts.
 
 ## Current commands
 
@@ -185,6 +195,8 @@ go run ./cmd/envctl recovery apply \
 go run ./cmd/envctl config resolve \
   --config ./examples/env-config --machine example-mac --json
 go run ./cmd/envctl history --json
+go run ./cmd/envctl update
+go run ./cmd/envctl rebuild
 go run ./cmd/envctl tui
 go run ./cmd/envctl fleet refresh
 go run ./cmd/envctl fleet export-decisions

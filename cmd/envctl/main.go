@@ -56,6 +56,8 @@ Usage:
   envctl recovery plan --config DIR --machine ID --local --json
   envctl recovery apply --config DIR --machine ID --local --json (--dry-run | --yes)
   envctl history --json [--state PATH] [--limit N]
+  envctl update [--source DIR] [--ref BRANCH]
+  envctl rebuild [--source DIR]
   envctl tui [--config DIR] [--inventory-dir DIR] [--state PATH]
   envctl fleet refresh [--config DIR] [--inventory-dir DIR] [--machines A,B] [--json]
   envctl fleet export-decisions [--config DIR] [--state PATH] [--json]
@@ -100,6 +102,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runConfig(args[1:], stdout, stderr)
 	case "history":
 		return runHistory(ctx, args[1:], stdout, stderr)
+	case "update":
+		return runSourceInstall(ctx, args[1:], stdout, stderr, true)
+	case "rebuild":
+		return runSourceInstall(ctx, args[1:], stdout, stderr, false)
 	case "tui":
 		return runFleetTUI(ctx, args[1:], stderr)
 	case "fleet":
