@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 
+	"github.com/VeniVidiVici/envctl/internal/fleetreconcile"
 	"github.com/VeniVidiVici/envctl/internal/model"
 )
 
@@ -101,6 +102,10 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.filterIndex = (m.filterIndex + 1) % len(filters)
 			m.cursor = 0
 			m.statusMessage = ""
+		case "e":
+			m.filterIndex = filterIndex("extra")
+			m.cursor = 0
+			m.statusMessage = "Showing installed packages that are absent from desired state"
 		case "a":
 			return m, m.saveSelectedDecision("adopt")
 		case "i":
@@ -159,7 +164,9 @@ func (m *Model) View() tea.View {
 
 	var body strings.Builder
 	body.WriteString(titleStyle.Render("envctl fleet"))
-	body.WriteString(mutedStyle.Render("  review only — no package operations"))
+	body.WriteString(mutedStyle.Render(
+		"  review extras here, then apply with fleet reconcile",
+	))
 	body.WriteString("\n\n")
 
 	for index, machine := range m.machines {
@@ -260,7 +267,7 @@ func (m *Model) View() tea.View {
 
 	body.WriteString("\n")
 	body.WriteString(mutedStyle.Render(
-		"[ / ] machine   j/k move   f filter   a adopt   p keep local   i ignore   x propose removal   c clear   q quit",
+		"[ / ] machine   j/k move   f filter   e extras   a sync to fleet   p keep local   i ignore   x uninstall here   c clear   q quit",
 	))
 	if m.statusMessage != "" {
 		body.WriteString("\n")
@@ -321,7 +328,13 @@ func (m *Model) saveSelectedDecision(value string) tea.Cmd {
 	machine := m.machines[m.machineIndex]
 	key := InventoryKey(finding.Installed[0])
 	profile := ""
-	if len(machine.Profiles) > 0 {
+	for _, candidate := range machine.Profiles {
+		if candidate == "shared" {
+			profile = candidate
+			break
+		}
+	}
+	if profile == "" && len(machine.Profiles) > 0 {
 		profile = machine.Profiles[len(machine.Profiles)-1]
 	}
 	return func() tea.Msg {
@@ -406,18 +419,21 @@ func (m *Model) renderDetail(machineID string, finding model.Finding) string {
 		))
 		if decision := m.decisions[decisionMapKey(machineID, InventoryKey(item))]; decision != "" {
 			lines = append(lines, "Decision: "+decision)
+			switch decision {
+			case "adopt":
+				lines = append(lines,
+					"Effect: add to the shared desired-state profile for the other Macs")
+			case "remove":
+				lines = append(lines,
+					"Effect: uninstall only from this Mac after dry-run and confirmation")
+			}
 		}
 	}
 	return strings.Join(lines, "\n")
 }
 
 func InventoryKey(item model.InstalledPackage) string {
-	return strings.Join([]string{
-		string(item.Manager),
-		string(item.Kind),
-		item.Source,
-		item.Package,
-	}, "|")
+	return fleetreconcile.InventoryKey(item)
 }
 
 func decisionMapKey(machineID, inventoryKey string) string {
@@ -436,12 +452,21 @@ func statusLabel(status model.FindingStatus) string {
 	case model.FindingAmbiguous:
 		return "ambiguous"
 	case model.FindingExtra:
-		return "extra"
+		return "EXTRA"
 	case model.FindingNotChecked:
 		return "unchecked"
 	default:
 		return string(status)
 	}
+}
+
+func filterIndex(name string) int {
+	for index, filter := range filters {
+		if filter == name {
+			return index
+		}
+	}
+	return 0
 }
 
 func refreshSymbol(status string) string {

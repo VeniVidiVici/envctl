@@ -16,6 +16,10 @@ type Entry struct {
 	InventoryKey string `yaml:"inventory_key" json:"inventory_key"`
 	Decision     string `yaml:"decision" json:"decision"`
 	Profile      string `yaml:"profile,omitempty" json:"profile,omitempty"`
+	Manager      string `yaml:"manager,omitempty" json:"manager,omitempty"`
+	Kind         string `yaml:"kind,omitempty" json:"kind,omitempty"`
+	Source       string `yaml:"source,omitempty" json:"source,omitempty"`
+	Package      string `yaml:"package,omitempty" json:"package,omitempty"`
 }
 
 type Document struct {
@@ -43,10 +47,18 @@ func Write(
 		if !knownMachines[decision.MachineID] {
 			continue
 		}
-		document.Decisions = append(document.Decisions, Entry{
+		entry := Entry{
 			Machine: decision.MachineID, InventoryKey: decision.InventoryKey,
 			Decision: decision.Value, Profile: decision.Profile,
-		})
+		}
+		parts := strings.Split(decision.InventoryKey, "|")
+		if len(parts) == 4 {
+			entry.Manager = parts[0]
+			entry.Kind = parts[1]
+			entry.Source = parts[2]
+			entry.Package = parts[3]
+		}
+		document.Decisions = append(document.Decisions, entry)
 	}
 	sort.Slice(document.Decisions, func(i, j int) bool {
 		if document.Decisions[i].Machine != document.Decisions[j].Machine {

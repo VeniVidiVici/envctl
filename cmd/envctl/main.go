@@ -20,6 +20,7 @@ import (
 	"github.com/VeniVidiVici/envctl/internal/customtool"
 	"github.com/VeniVidiVici/envctl/internal/decisionexport"
 	"github.com/VeniVidiVici/envctl/internal/executor"
+	"github.com/VeniVidiVici/envctl/internal/fleetreconcile"
 	"github.com/VeniVidiVici/envctl/internal/fleetrefresh"
 	"github.com/VeniVidiVici/envctl/internal/fleetui"
 	"github.com/VeniVidiVici/envctl/internal/homebrew"
@@ -57,6 +58,7 @@ Usage:
   envctl tui --config DIR --inventory-dir DIR [--state PATH]
   envctl fleet refresh --config DIR --inventory-dir DIR --json
   envctl fleet export-decisions --config DIR [--state PATH] --json
+  envctl fleet reconcile --config DIR --inventory-dir DIR --machine ID --local --json (--dry-run | --yes)
 `
 
 func main() {
@@ -2641,9 +2643,389 @@ func runFleet(
 		return runFleetRefresh(ctx, args[1:], stdout, stderr)
 	case "export-decisions":
 		return runFleetExportDecisions(ctx, args[1:], stdout, stderr)
+	case "reconcile":
+		return runFleetReconcile(ctx, args[1:], stdout, stderr)
 	default:
 		return fmt.Errorf("unknown fleet command %q", args[0])
 	}
+}
+
+type fleetReconcileResult struct {
+	Sequence     int                       `json:"sequence"`
+	InventoryKey string                    `json:"inventory_key"`
+	Decision     string                    `json:"decision"`
+	Status       string                    `json:"status"`
+	Config       *envconfig.AdoptionResult `json:"config,omitempty"`
+	Stdout       string                    `json:"stdout,omitempty"`
+	Stderr       string                    `json:"stderr,omitempty"`
+	Error        string                    `json:"error,omitempty"`
+}
+
+type fleetReconcileResponse struct {
+	Mode                   string                 `json:"mode"`
+	MachineID              string                 `json:"machine_id"`
+	Profile                string                 `json:"profile"`
+	Plan                   fleetreconcile.Plan    `json:"plan"`
+	Results                []fleetReconcileResult `json:"results,omitempty"`
+	RunID                  string                 `json:"run_id,omitempty"`
+	PlanID                 string                 `json:"plan_id,omitempty"`
+	VerificationSnapshotID string                 `json:"verification_snapshot_id,omitempty"`
+	Verified               bool                   `json:"verified"`
+}
+
+func runFleetReconcile(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("fleet reconcile", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	inventoryDirectory := flags.String(
+		"inventory-dir", "", "directory containing MACHINE.json audit files",
+	)
+	machineID := flags.String("machine", "", "machine whose reviewed extras to reconcile")
+	profileName := flags.String(
+		"profile", "shared", "profile that adopted packages should join",
+	)
+	statePath := flags.String("state", "", "SQLite state database path")
+	localMachine := flags.Bool(
+		"local", false, "verify this Mac's identity before local removals",
+	)
+	dryRun := flags.Bool(
+		"dry-run", false, "print reviewed config edits and uninstall commands",
+	)
+	yes := flags.Bool(
+		"yes", false, "apply the reviewed config edits and local removals",
+	)
+	asJSON := flags.Bool("json", false, "print reconciliation as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if *configRoot == "" || *inventoryDirectory == "" || *machineID == "" {
+		return errors.New("--config, --inventory-dir, and --machine are required")
+	}
+	if !*localMachine {
+		return errors.New("fleet reconciliation currently requires --local")
+	}
+	if !*asJSON {
+		return errors.New("fleet reconciliation currently requires --json")
+	}
+	if *dryRun == *yes {
+		return errors.New("exactly one of --dry-run or --yes is required")
+	}
+	expandedInventoryDirectory, err := expandHome(*inventoryDirectory)
+	if err != nil {
+		return err
+	}
+	loaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	if err := forceLocalMachine(ctx, &loaded); err != nil {
+		return err
+	}
+	profile, err := fleetreconcile.ProfileByName(loaded.Profiles, *profileName)
+	if err != nil {
+		return err
+	}
+	inventory, err := loadInventory(filepath.Join(
+		expandedInventoryDirectory, *machineID+".json",
+	))
+	if err != nil {
+		return fmt.Errorf("load %s inventory: %w", *machineID, err)
+	}
+	databasePath := *statePath
+	if databasePath == "" {
+		databasePath = loaded.Database
+	}
+	state, err := openState(databasePath)
+	if err != nil {
+		return err
+	}
+	defer state.Close()
+	decisions, err := state.LatestDecisions(ctx, *machineID)
+	if err != nil {
+		return err
+	}
+	reconciliation := fleetreconcile.Build(
+		*machineID, *profileName, decisions, inventory,
+		loaded.Catalog.Packages, profile,
+	)
+	mode := "dry-run"
+	if *yes {
+		mode = "apply"
+	}
+	response := fleetReconcileResponse{
+		Mode: mode, MachineID: *machineID, Profile: *profileName,
+		Plan: reconciliation,
+	}
+	if *dryRun {
+		return encodeJSON(stdout, response)
+	}
+	if !reconciliation.Ready {
+		return fmt.Errorf(
+			"refuse fleet reconciliation with %d blocker(s)",
+			len(reconciliation.Blockers),
+		)
+	}
+	planned := plannedReconcileActions(reconciliation.Actions)
+	if len(planned) == 0 {
+		response.Verified = true
+		return encodeJSON(stdout, response)
+	}
+	for _, action := range planned {
+		if action.Decision != "remove" {
+			continue
+		}
+		present, err := packagePresent(ctx, action.Installed)
+		if err != nil {
+			return fmt.Errorf(
+				"preflight removal %s: %w", action.InventoryKey, err,
+			)
+		}
+		if !present {
+			return fmt.Errorf(
+				"preflight removal %s: package is absent from live inventory; refresh and review again",
+				action.InventoryKey,
+			)
+		}
+	}
+
+	hostname, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("read hostname: %w", err)
+	}
+	beforeSnapshot, err := state.RecordAudit(ctx, store.MachineInfo{
+		ID: *machineID, Hostname: hostname,
+	}, inventory)
+	if err != nil {
+		return err
+	}
+	journalPlan := reconciliationJournalPlan(planned)
+	record, err := state.RecordPlan(
+		ctx, *machineID, beforeSnapshot.ID, loaded.Digest,
+		"fleet reconcile", true, journalPlan,
+	)
+	if err != nil {
+		return err
+	}
+	response.RunID = record.RunID
+	response.PlanID = record.PlanID
+	if err := state.BeginApply(ctx, record.RunID, record.PlanID); err != nil {
+		return err
+	}
+
+	runner := executor.ExecRunner{Progress: stderr}
+	for index, action := range planned {
+		if err := state.StartAction(ctx, record.PlanID, action.Sequence); err != nil {
+			return err
+		}
+		result := fleetReconcileResult{
+			Sequence: action.Sequence, InventoryKey: action.InventoryKey,
+			Decision: action.Decision,
+		}
+		var actionErr error
+		switch action.Decision {
+		case "adopt":
+			configResult, err := envconfig.AdoptPackages(
+				*configRoot, *profileName,
+				[]envconfig.PackageAdoption{{
+					ID: action.PackageID, Spec: *action.Spec,
+				}},
+			)
+			if err != nil {
+				actionErr = err
+			} else {
+				result.Config = &configResult
+			}
+		case "remove":
+			fmt.Fprintf(
+				stderr,
+				"\n==> Uninstalling %s from %s (%s)\n",
+				action.Installed.Package, *machineID, action.Installed.Manager,
+			)
+			result.Stdout, result.Stderr, actionErr = runner.Run(
+				ctx, action.Command.Name, action.Command.Args...,
+			)
+			if actionErr == nil {
+				actionErr = verifyPackageRemoved(ctx, action.Installed)
+			}
+		default:
+			actionErr = fmt.Errorf("unsupported decision %q", action.Decision)
+		}
+		if actionErr != nil {
+			result.Status = executor.StatusFailed
+			result.Error = actionErr.Error()
+			response.Results = append(response.Results, result)
+			_ = state.FinishAction(
+				ctx, record.PlanID, action.Sequence,
+				store.ActionStatusFailed, actionErr.Error(),
+			)
+			for _, remaining := range planned[index+1:] {
+				_ = state.SkipAction(
+					ctx, record.PlanID, remaining.Sequence,
+					"not attempted because an earlier reconciliation action failed",
+				)
+			}
+			_ = state.CompleteApply(
+				ctx, record.RunID, record.PlanID, "", store.ActionStatusFailed,
+			)
+			return fmt.Errorf(
+				"reconcile action %d (%s): %w",
+				action.Sequence, action.InventoryKey, actionErr,
+			)
+		}
+		result.Status = executor.StatusCompleted
+		response.Results = append(response.Results, result)
+		if err := state.FinishAction(
+			ctx, record.PlanID, action.Sequence,
+			store.ActionStatusCompleted, "",
+		); err != nil {
+			return err
+		}
+		if _, err := state.RecordDecision(
+			ctx, *machineID, action.InventoryKey, "clear", *profileName,
+			"fleet reconciliation completed",
+		); err != nil {
+			return err
+		}
+	}
+
+	reloaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return fmt.Errorf("reload reconciled configuration: %w", err)
+	}
+	afterInventory := collectInventory(ctx, reloaded.Desired.Links)
+	verificationSnapshot, err := state.RecordAudit(
+		ctx,
+		store.MachineInfo{ID: *machineID, Hostname: hostname},
+		afterInventory,
+	)
+	if err != nil {
+		return err
+	}
+	response.VerificationSnapshotID = verificationSnapshot.ID
+	response.Verified = true
+	if err := state.CompleteApply(
+		ctx, record.RunID, record.PlanID,
+		verificationSnapshot.ID, store.ActionStatusCompleted,
+	); err != nil {
+		return err
+	}
+	return encodeJSON(stdout, response)
+}
+
+func plannedReconcileActions(
+	actions []fleetreconcile.Action,
+) []fleetreconcile.Action {
+	var planned []fleetreconcile.Action
+	for _, action := range actions {
+		if action.Status == fleetreconcile.StatusPlanned {
+			planned = append(planned, action)
+		}
+	}
+	return planned
+}
+
+func reconciliationJournalPlan(
+	actions []fleetreconcile.Action,
+) model.Plan {
+	plan := model.Plan{
+		Summary: model.PlanSummary{Actions: len(actions)},
+		Actions: make([]model.Action, 0, len(actions)),
+	}
+	for _, action := range actions {
+		actionType := model.ActionAdopt
+		risk := model.RiskLow
+		reversible := true
+		packageID := action.PackageID
+		if action.Decision == "remove" {
+			actionType = model.ActionRemove
+			risk = model.RiskMedium
+			reversible = false
+			packageID = action.Installed.Package
+		}
+		plan.Actions = append(plan.Actions, model.Action{
+			Sequence: action.Sequence, Type: actionType,
+			PackageID: packageID,
+			Manager:   action.Installed.Manager,
+			Kind:      action.Installed.Kind,
+			Source:    action.Installed.Source,
+			Package:   action.Installed.Package,
+			Version:   action.Installed.Version,
+			Risk:      risk, Reversible: reversible,
+			RequiresPrivilege: action.Installed.Manager == model.ManagerMAS,
+			Reason:            action.Detail,
+		})
+	}
+	return plan
+}
+
+func verifyPackageRemoved(
+	ctx context.Context,
+	item model.InstalledPackage,
+) error {
+	present, err := packagePresent(ctx, item)
+	if err != nil {
+		return err
+	}
+	if present {
+		return fmt.Errorf(
+			"post-removal verification still finds %s",
+			fleetreconcile.InventoryKey(item),
+		)
+	}
+	return nil
+}
+
+func packagePresent(
+	ctx context.Context,
+	item model.InstalledPackage,
+) (bool, error) {
+	packages, err := collectManagerPackages(ctx, item.Manager)
+	if err != nil {
+		return false, fmt.Errorf(
+			"collect %s inventory: %w", item.Manager, err,
+		)
+	}
+	key := fleetreconcile.InventoryKey(item)
+	for _, installed := range packages {
+		if fleetreconcile.InventoryKey(installed) == key {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func collectManagerPackages(
+	ctx context.Context,
+	manager model.Manager,
+) ([]model.InstalledPackage, error) {
+	var (
+		packages []model.InstalledPackage
+		err      error
+	)
+	switch manager {
+	case model.ManagerBrew:
+		packages, err = homebrew.NewCollector(homebrew.ExecRunner{}).Collect(ctx)
+	case model.ManagerMAS:
+		packages, err = mas.NewCollector(mas.ExecRunner{}).Collect(ctx)
+	case model.ManagerBun:
+		var collector bun.Collector
+		collector, err = bun.DefaultCollector()
+		if err == nil {
+			packages, err = collector.Collect(ctx)
+		}
+	case model.ManagerMise:
+		packages, err = mise.NewCollector(mise.ExecRunner{}).Collect(ctx)
+	default:
+		return nil, fmt.Errorf("unsupported manager %q", manager)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return packages, nil
 }
 
 func runFleetExportDecisions(
