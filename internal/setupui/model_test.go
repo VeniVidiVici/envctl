@@ -103,7 +103,11 @@ func TestAutomaticRunsReadyPhasesInOrder(t *testing.T) {
 			command, model, factory,
 		)
 	}
-	_, command = model.Update(phaseFinishedMsg{id: PhaseRecovery})
+	finished, ok := command().(phaseFinishedMsg)
+	if !ok || finished.id != PhaseRecovery || finished.err != nil {
+		t.Fatalf("initial automatic command result = %#v", finished)
+	}
+	_, command = model.Update(finished)
 	if command == nil || !model.running ||
 		factory.phase.ID != PhaseLinks ||
 		model.phases[0].Status != StatusCompleted {
@@ -112,7 +116,11 @@ func TestAutomaticRunsReadyPhasesInOrder(t *testing.T) {
 			command, model, factory,
 		)
 	}
-	_, command = model.Update(phaseFinishedMsg{id: PhaseLinks})
+	finished, ok = command().(phaseFinishedMsg)
+	if !ok || finished.id != PhaseLinks || finished.err != nil {
+		t.Fatalf("second automatic command result = %#v", finished)
+	}
+	_, command = model.Update(finished)
 	if command == nil || model.running ||
 		model.phases[1].Status != StatusCompleted ||
 		!strings.Contains(model.statusMessage, "completed") {
