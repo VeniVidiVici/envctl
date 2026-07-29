@@ -262,10 +262,10 @@ func buildSetupPhases(
 			packagePlan,
 			model.ManagerMAS,
 			setupui.PhaseMAS,
-			"Mac App Store review",
-			"Run the read-only compatibility and account preflight; App Store installation remains manual.",
+			"Mac App Store apps",
+			"Install free and already-owned apps; defer purchases and incompatible apps.",
 			[]setupui.PhaseID{setupui.PhaseHomebrew},
-			false,
+			true,
 		),
 		buildManualSetupPhase(packagePlan),
 	)
@@ -406,15 +406,11 @@ func buildManagerSetupPhase(
 	collector := collectorForApply(manager)
 	if !hasCollector(inventory, collector) {
 		phase.Actions = desiredCount
-		if manager == model.ManagerMAS {
-			phase.Status = setupui.StatusReview
-		} else {
-			phase.Status = setupui.StatusReady
-		}
+		phase.Status = setupui.StatusReady
 		phase.Description += " Current inventory is unavailable; this phase replans after its prerequisites."
 	} else if manager == model.ManagerMAS {
 		if len(selected) > 0 {
-			phase.Status = setupui.StatusReview
+			phase.Status = setupui.StatusReady
 		}
 	} else {
 		_, blocked := classifyActions(selected)
@@ -1436,10 +1432,8 @@ func runApply(
 	if *setupProgress {
 		fmt.Fprintf(stderr, "\n==> %s\n", applyManagerLabel(selectedManager))
 	}
-	if selectedManager == model.ManagerMAS && *yes {
-		return errors.New(
-			"Mac App Store execution is not enabled; use --manager mas --dry-run",
-		)
+	if selectedManager == model.ManagerMAS && *yes && !*localMachine {
+		return errors.New("Mac App Store execution requires --local")
 	}
 
 	loaded, err := envconfig.Load(*configRoot, *machineID)
@@ -1472,6 +1466,11 @@ func runApply(
 	selectedActions, deferredActions := selectActions(
 		beforePlan.Actions, selectedManager,
 	)
+	executableActions := append([]model.Action(nil), selectedActions...)
+	var commands []executor.Command
+	var blockedActions []blockedAction
+	var masPreflight *mas.PreflightReport
+	var masInstallations []mas.Installation
 	if selectedManager == model.ManagerMAS {
 		actionRunner, err := executionRunnerFor(loaded, nil)
 		if err != nil {
@@ -1483,31 +1482,33 @@ func runApply(
 		if err != nil {
 			return err
 		}
-		blocked := make([]blockedAction, 0, len(selectedActions))
-		for _, action := range selectedActions {
-			blocked = append(blocked, blockedAction{
-				Action: action,
-				Reason: "Mac App Store execution is disabled; inspect mas_preflight",
+		masPreflight = &preflight
+		var deferredMAS []mas.DeferredInstallation
+		masInstallations, deferredMAS, err = mas.PlanInstallations(
+			selectedActions,
+			preflight,
+		)
+		if err != nil {
+			return err
+		}
+		executableActions = make([]model.Action, 0, len(masInstallations))
+		commands = make([]executor.Command, 0, len(masInstallations))
+		for _, installation := range masInstallations {
+			executableActions = append(
+				executableActions,
+				installation.Action,
+			)
+			commands = append(commands, installation.Command)
+		}
+		for _, deferred := range deferredMAS {
+			blockedActions = append(blockedActions, blockedAction{
+				Action: deferred.Action,
+				Reason: deferred.Reason,
 			})
 		}
-		response := applyResponse{
-			Mode:            "dry-run",
-			MachineID:       loaded.Machine.ID,
-			AccessType:      loaded.Machine.Access.Type,
-			Manager:         selectedManager,
-			ConfigDigest:    loaded.Digest,
-			Before:          beforePlan,
-			BlockedActions:  blocked,
-			DeferredActions: deferredActions,
-			MASPreflight:    &preflight,
-			Ready:           false,
-			Verified:        len(selectedActions) == 0,
-		}
-		return writeApplyResponse(
-			stdout, stderr, response, *setupProgress,
-		)
+	} else {
+		commands, blockedActions = classifyActions(selectedActions)
 	}
-	commands, blockedActions := classifyActions(selectedActions)
 	mode := "dry-run"
 	if *yes {
 		mode = "apply"
@@ -1522,15 +1523,16 @@ func runApply(
 		Execution:       executor.Report{Commands: commands},
 		BlockedActions:  blockedActions,
 		DeferredActions: deferredActions,
+		MASPreflight:    masPreflight,
 		Ready:           len(blockedActions) == 0,
-		Verified:        len(selectedActions) == 0,
+		Verified:        len(executableActions) == 0,
 	}
 	if *dryRun {
 		return writeApplyResponse(
 			stdout, stderr, response, *setupProgress,
 		)
 	}
-	if len(blockedActions) > 0 {
+	if len(blockedActions) > 0 && selectedManager != model.ManagerMAS {
 		return fmt.Errorf(
 			"refuse mixed or unsupported apply plan: %d action(s) are blocked",
 			len(blockedActions),
@@ -1584,7 +1586,7 @@ func runApply(
 	if err != nil {
 		return err
 	}
-	recordedPlan := scopedPlan(beforePlan, selectedActions, selectedManager)
+	recordedPlan := scopedPlan(beforePlan, executableActions, selectedManager)
 	commandName := "apply"
 	if selectedManager != "" {
 		commandName += " --manager " + string(selectedManager)
@@ -1602,10 +1604,33 @@ func runApply(
 		return err
 	}
 
-	report, applyErr := executor.New(
-		actionRunner,
-		stateActionJournal{state: state, planID: record.PlanID},
-	).Apply(ctx, selectedActions)
+	journal := stateActionJournal{state: state, planID: record.PlanID}
+	var (
+		report              executor.Report
+		verificationActions []model.Action
+		applyErr            error
+	)
+	if selectedManager == model.ManagerMAS {
+		var executionBlocked []blockedAction
+		report, verificationActions, executionBlocked, applyErr =
+			applyMASInstallations(
+				ctx,
+				actionRunner,
+				journal,
+				masInstallations,
+			)
+		response.BlockedActions = append(
+			response.BlockedActions,
+			executionBlocked...,
+		)
+		response.Ready = len(response.BlockedActions) == 0
+	} else {
+		report, applyErr = executor.New(
+			actionRunner,
+			journal,
+		).Apply(ctx, executableActions)
+		verificationActions = executableActions
+	}
 	response.Execution = report
 
 	var completionErrors []error
@@ -1620,7 +1645,7 @@ func runApply(
 		)
 		response.After = &afterPlan
 		collectorErr = requireCollector(afterInventory, requiredCollector)
-		verified, err := verifyActions(selectedActions, afterPlan)
+		verified, err := verifyActions(verificationActions, afterPlan)
 		verificationErr = err
 		response.Verified = verified && collectorErr == nil && applyErr == nil
 
@@ -1678,6 +1703,118 @@ func (a masOutputAdapter) Output(
 	return []byte(stdout), nil
 }
 
+func applyMASInstallations(
+	ctx context.Context,
+	runner executor.Runner,
+	journal executor.Journal,
+	installations []mas.Installation,
+) (
+	executor.Report,
+	[]model.Action,
+	[]blockedAction,
+	error,
+) {
+	report := executor.Report{
+		Commands: make([]executor.Command, 0, len(installations)),
+		Results:  make([]executor.Result, 0, len(installations)),
+	}
+	completed := make([]model.Action, 0, len(installations))
+	var blocked []blockedAction
+	var failures []error
+
+	for _, installation := range installations {
+		command := installation.Command
+		report.Commands = append(report.Commands, command)
+		if err := journal.StartAction(ctx, command.Sequence); err != nil {
+			return report, completed, blocked, fmt.Errorf(
+				"journal action %d start: %w",
+				command.Sequence,
+				err,
+			)
+		}
+
+		stdout, stderr, runErr := runner.Run(
+			ctx,
+			command.Name,
+			command.Args...,
+		)
+		result := executor.Result{
+			Command: command,
+			Stdout:  truncateApplyOutput(stdout, 4000),
+			Stderr:  truncateApplyOutput(stderr, 4000),
+		}
+		if runErr == nil {
+			result.Status = executor.StatusCompleted
+			report.Results = append(report.Results, result)
+			completed = append(completed, installation.Action)
+			if err := journal.FinishAction(
+				ctx,
+				command.Sequence,
+				executor.StatusCompleted,
+				"",
+			); err != nil {
+				return report, completed, blocked, fmt.Errorf(
+					"journal action %d completion: %w",
+					command.Sequence,
+					err,
+				)
+			}
+			continue
+		}
+
+		reason := applyCommandError(runErr, stderr)
+		status := executor.StatusFailed
+		if installation.OwnedOnly {
+			status = executor.StatusSkipped
+			reason = "not installed as an already-owned app; purchase it " +
+				"in the App Store or verify the signed-in Apple Account: " +
+				reason
+		} else {
+			failures = append(failures, fmt.Errorf(
+				"install Mac App Store app %s: %s",
+				installation.Action.PackageID,
+				reason,
+			))
+		}
+		result.Status = status
+		result.ErrorSummary = reason
+		report.Results = append(report.Results, result)
+		blocked = append(blocked, blockedAction{
+			Action: installation.Action,
+			Reason: reason,
+		})
+		if err := journal.FinishAction(
+			ctx,
+			command.Sequence,
+			status,
+			reason,
+		); err != nil {
+			return report, completed, blocked, fmt.Errorf(
+				"journal action %d %s: %w",
+				command.Sequence,
+				status,
+				err,
+			)
+		}
+	}
+	return report, completed, blocked, errors.Join(failures...)
+}
+
+func applyCommandError(runErr error, stderr string) string {
+	detail := strings.TrimSpace(stderr)
+	if detail == "" {
+		detail = runErr.Error()
+	}
+	return truncateApplyOutput(detail, 1000)
+}
+
+func truncateApplyOutput(value string, limit int) string {
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "..."
+}
+
 func parseApplyManager(value string) (model.Manager, error) {
 	switch model.Manager(value) {
 	case "":
@@ -1710,31 +1847,67 @@ func writeSetupApplySummary(
 	var summary strings.Builder
 	label := applyManagerLabel(response.Manager)
 	if response.Manager == model.ManagerMAS {
-		if len(response.BlockedActions) == 0 {
+		completed := 0
+		ownedOnly := 0
+		for _, result := range response.Execution.Results {
+			if result.Status == executor.StatusCompleted {
+				completed++
+			}
+		}
+		if response.MASPreflight != nil {
+			for _, app := range response.MASPreflight.Apps {
+				if app.RequiresOwnership && len(app.Blockers) == 0 {
+					ownedOnly++
+				}
+			}
+		}
+		switch {
+		case response.Mode == "dry-run":
+			fmt.Fprintf(
+				&summary,
+				"\n==> %s: %d install(s) ready",
+				label,
+				len(response.Execution.Commands),
+			)
+			if ownedOnly > 0 {
+				fmt.Fprintf(
+					&summary,
+					"; %d paid app(s) require existing ownership",
+					ownedOnly,
+				)
+			}
+			summary.WriteString("\n")
+		case completed > 0:
+			fmt.Fprintf(
+				&summary,
+				"\n==> %s: %d installed",
+				label,
+				completed,
+			)
+			if len(response.BlockedActions) > 0 {
+				fmt.Fprintf(
+					&summary,
+					"; %d need manual action",
+					len(response.BlockedActions),
+				)
+			}
+			summary.WriteString("\n")
+		case len(response.BlockedActions) == 0:
 			fmt.Fprintf(&summary, "\n==> %s: already satisfied\n", label)
-		} else {
+		default:
 			fmt.Fprintf(
 				&summary,
 				"\n==> %s: %d app(s) need review\n",
 				label,
 				len(response.BlockedActions),
 			)
-			if response.MASPreflight != nil {
-				for _, app := range response.MASPreflight.Apps {
-					detail := "available for installation from the App Store"
-					if len(app.Blockers) > 0 {
-						detail = app.Blockers[0]
-					}
-					fmt.Fprintf(
-						&summary,
-						"    - %s: %s\n",
-						app.Name,
-						detail,
-					)
-				}
-			}
-			summary.WriteString(
-				"    No Mac App Store apps were installed automatically.\n",
+		}
+		for _, item := range response.BlockedActions {
+			fmt.Fprintf(
+				&summary,
+				"    - %s: %s\n",
+				masAppName(response.MASPreflight, item.Action),
+				item.Reason,
 			)
 		}
 		_, err := io.WriteString(writer, summary.String())
@@ -1784,10 +1957,24 @@ func applyManagerLabel(manager model.Manager) string {
 	case model.ManagerCustom:
 		return "Custom tools"
 	case model.ManagerMAS:
-		return "Mac App Store review"
+		return "Mac App Store apps"
 	default:
 		return "Packages"
 	}
+}
+
+func masAppName(
+	preflight *mas.PreflightReport,
+	action model.Action,
+) string {
+	if preflight != nil {
+		for _, app := range preflight.Apps {
+			if app.PackageID == action.PackageID && app.Name != "" {
+				return app.Name
+			}
+		}
+	}
+	return action.PackageID
 }
 
 func collectorForApply(manager model.Manager) string {

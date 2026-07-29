@@ -24,17 +24,18 @@ type PreflightReport struct {
 }
 
 type AppPreflight struct {
-	PackageID        string   `json:"package_id"`
-	AdamID           string   `json:"adam_id"`
-	Name             string   `json:"name,omitempty"`
-	Version          string   `json:"version,omitempty"`
-	FormattedPrice   string   `json:"formatted_price,omitempty"`
-	Price            float64  `json:"price"`
-	MinimumOS        string   `json:"minimum_os,omitempty"`
-	Available        bool     `json:"available"`
-	Compatible       bool     `json:"compatible"`
-	CandidateCommand []string `json:"candidate_command,omitempty"`
-	Blockers         []string `json:"blockers,omitempty"`
+	PackageID         string   `json:"package_id"`
+	AdamID            string   `json:"adam_id"`
+	Name              string   `json:"name,omitempty"`
+	Version           string   `json:"version,omitempty"`
+	FormattedPrice    string   `json:"formatted_price,omitempty"`
+	Price             float64  `json:"price"`
+	MinimumOS         string   `json:"minimum_os,omitempty"`
+	Available         bool     `json:"available"`
+	Compatible        bool     `json:"compatible"`
+	RequiresOwnership bool     `json:"requires_ownership,omitempty"`
+	CandidateCommand  []string `json:"candidate_command,omitempty"`
+	Blockers          []string `json:"blockers,omitempty"`
 }
 
 type configRecord struct {
@@ -80,11 +81,11 @@ func Preflight(
 	if _, err := runner.Output(ctx, "sudo", "-n", "true"); err == nil {
 		report.NoninteractiveRoot = true
 	} else {
-		report.Blockers = append(report.Blockers,
-			"non-interactive sudo is unavailable; mas would require a password prompt")
+		report.Warnings = append(report.Warnings,
+			"mas may request the macOS user password for installation")
 	}
-	report.Blockers = append(report.Blockers,
-		"App Store Apple Account sign-in and per-app authorization cannot be verified noninteractively")
+	report.Warnings = append(report.Warnings,
+		"App Store sign-in and per-app authorization may require interactive confirmation")
 
 	for _, action := range actions {
 		app := AppPreflight{
@@ -135,14 +136,13 @@ func Preflight(
 				fmt.Sprintf("requires macOS %s or newer", lookup.MinimumOSVersion))
 		}
 		if lookup.Price > 0 {
-			app.Blockers = append(app.Blockers,
-				"paid apps cannot be purchased by mas; ownership must be confirmed in App Store")
+			app.RequiresOwnership = true
 			app.CandidateCommand = []string{
-				"sudo", "-n", "mas", "install", action.Package,
+				"mas", "install", action.Package,
 			}
 		} else {
 			app.CandidateCommand = []string{
-				"sudo", "-n", "mas", "get", action.Package,
+				"mas", "get", action.Package,
 			}
 		}
 		report.Apps = append(report.Apps, app)
@@ -156,7 +156,7 @@ func Preflight(
 		}
 	}
 	report.Warnings = append(report.Warnings,
-		"candidate commands are informational only and were not executed")
+		"paid apps are installed only when already owned; mas cannot purchase them")
 	report.Ready = len(report.Blockers) == 0
 	return report, nil
 }

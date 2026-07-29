@@ -73,7 +73,7 @@ envctl setup \
 ```
 
 Setup presents credential recovery, portable links, Homebrew, Mise, Bun,
-fixed-registry custom tools, Mac App Store review, and explicitly manual tools
+fixed-registry custom tools, Mac App Store apps, and explicitly manual tools
 as ordered phases. Each executable phase launches the existing scoped envctl
 transaction in a child process, so it replans against live state, asks for
 confirmation, journals mutations, and verifies the result. `--json` prints the
@@ -174,6 +174,8 @@ go run ./cmd/envctl apply \
   --config ../env-config --machine remote-mac --manager mise --yes --json
 go run ./cmd/envctl apply \
   --config ../env-config --machine remote-mac --manager mas --dry-run --json
+go run ./cmd/envctl apply \
+  --config ../env-config --machine example-mac --local --manager mas --yes --json
 go run ./cmd/envctl links apply \
   --config ../env-config --machine example-mac --local --dry-run --json
 go run ./cmd/envctl recovery plan \
@@ -247,21 +249,25 @@ compiled-in identities: the official native Claude Code installer, the
 `dlvhdr/gh-dash` GitHub CLI extension, and the official native OpenCode
 installer. No installer command or URL is loaded from configuration.
 
-MAS is preflight-only. `--manager mas --dry-run` performs read-only storefront
-lookups on the target and reports mas version, storefront, macOS compatibility,
-price, noninteractive sudo readiness, unknown Apple Account state, and an
-informational candidate command for each app. `--manager mas --yes` is rejected
-before config access or SSH. This prevents headless runs from hanging on sudo,
-Touch ID, Apple Account, purchase, or App Store GUI prompts.
+`--manager mas --dry-run` performs read-only storefront lookups and reports mas
+version, storefront, macOS compatibility, price, interactive authorization
+warnings, and the validated command for each app. A local
+`--manager mas --yes` run gets free apps and attempts to install paid apps only
+through the already-owned redownload path. `mas` cannot purchase paid apps.
+Apps that are not owned, unavailable, or incompatible are deferred with a
+specific reason while eligible apps continue. The local terminal remains
+attached for macOS password, Touch ID, Apple Account, or App Store prompts.
 
-The executor fails fast, journals every action locally in SQLite, performs a
+The executor journals every action locally in SQLite, performs a
 fresh inventory on the target, and only marks the run complete when each
-applied package has reached its declared type, source, and configured Mise
-version request. Remote commands use strict, noninteractive, independent SSH
-connections and accept only the exact validated package-manager argv.
-Homebrew upgrades, removals, source repair, Mac App Store installation, Bun
-updates/removals, unregistered custom tools, and privileged actions are not
-supported by this slice.
+successfully applied package has reached its declared type, source, and
+configured Mise version request. General package execution fails fast; the
+local Mac App Store batch instead continues past an unowned paid app so free
+and already-owned apps can still converge. Remote commands use strict,
+noninteractive, independent SSH connections and accept only the exact
+validated package-manager argv. Homebrew upgrades, removals, source repair,
+Bun updates/removals, unregistered custom tools, and arbitrary privileged
+actions are not supported by this slice.
 
 Audits and plans are recorded in `~/.local/state/envctl/state.db` by default.
 Use `--no-record` for an entirely ephemeral run or `--state PATH` to select a

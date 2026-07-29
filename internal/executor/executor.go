@@ -18,6 +18,7 @@ import (
 const (
 	StatusCompleted = "completed"
 	StatusFailed    = "failed"
+	StatusSkipped   = "skipped"
 )
 
 var (
