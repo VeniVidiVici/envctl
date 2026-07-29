@@ -80,6 +80,65 @@ func TestReviewPhaseRunsWithoutMutationConfirmation(t *testing.T) {
 	}
 }
 
+func TestAutomaticRunsReadyPhasesInOrder(t *testing.T) {
+	factory := &fakeCommandFactory{}
+	model := New("example-mac", []Phase{
+		{
+			ID: PhaseRecovery, Label: "Credential recovery",
+			Status: StatusReady, Actions: 2, Command: []string{"recovery"},
+		},
+		{
+			ID: PhaseLinks, Label: "Portable links",
+			Status: StatusReady, Actions: 1,
+			Dependencies: []PhaseID{PhaseRecovery},
+			Command:      []string{"links"},
+		},
+	}, factory).Automatic()
+
+	command := model.Init()
+	if command == nil || !model.running ||
+		factory.phase.ID != PhaseRecovery || model.confirming {
+		t.Fatalf(
+			"initial automatic phase = command %v model %#v factory %#v",
+			command, model, factory,
+		)
+	}
+	_, command = model.Update(phaseFinishedMsg{id: PhaseRecovery})
+	if command == nil || !model.running ||
+		factory.phase.ID != PhaseLinks ||
+		model.phases[0].Status != StatusCompleted {
+		t.Fatalf(
+			"second automatic phase = command %v model %#v factory %#v",
+			command, model, factory,
+		)
+	}
+	_, command = model.Update(phaseFinishedMsg{id: PhaseLinks})
+	if command == nil || model.running ||
+		model.phases[1].Status != StatusCompleted ||
+		!strings.Contains(model.statusMessage, "completed") {
+		t.Fatalf("automatic completion = command %v model %#v", command, model)
+	}
+}
+
+func TestAutomaticStopsAtBlockedPhase(t *testing.T) {
+	factory := &fakeCommandFactory{}
+	model := New("example-mac", []Phase{{
+		ID: PhaseRecovery, Label: "Credential recovery",
+		Status: StatusBlocked, Blockers: 1,
+		Diagnostics: []string{"gpg is unavailable"},
+	}}, factory).Automatic()
+
+	if command := model.Init(); command != nil || model.running {
+		t.Fatalf("blocked automatic setup = command %v model %#v", command, model)
+	}
+	if !strings.Contains(model.statusMessage, "automatic setup stopped") {
+		t.Fatalf("blocked status = %q", model.statusMessage)
+	}
+	if !strings.Contains(model.View().Content, "gpg is unavailable") {
+		t.Fatalf("blocked diagnostics are not visible:\n%s", model.View().Content)
+	}
+}
+
 func TestViewShowsUnifiedSetupState(t *testing.T) {
 	model := New("example-mac", []Phase{
 		{

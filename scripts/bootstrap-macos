@@ -256,11 +256,12 @@ launch_guided_setup() {
 		log "Launching interactive onboarding and guided setup"
 		"$ENVCTL_BINARY" onboard \
 			--config "$ENV_CONFIG_CHECKOUT" \
-			--setup
+			--setup \
+			--auto
 		return
 	fi
 	printf '\nRun onboarding and setup from an interactive terminal:\n'
-	printf '  %q onboard --config %q --setup\n' \
+	printf '  %q onboard --config %q --setup --auto\n' \
 		"$ENVCTL_BINARY" "$ENV_CONFIG_CHECKOUT"
 }
 
