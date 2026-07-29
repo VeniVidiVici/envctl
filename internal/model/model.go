@@ -87,6 +87,19 @@ type RecoverySpec struct {
 	Fingerprint string            `json:"fingerprint,omitempty" yaml:"fingerprint,omitempty"`
 }
 
+type AppSettingKind string
+
+const (
+	AppSettingTailscaleStartOnLogin AppSettingKind = "tailscale-start-on-login"
+)
+
+type AppSettingSpec struct {
+	ID                 string         `json:"id" yaml:"id,omitempty"`
+	Kind               AppSettingKind `json:"kind" yaml:"kind"`
+	PackageID          string         `json:"package_id" yaml:"package_id"`
+	VerifyAfterRestart bool           `json:"verify_after_restart,omitempty" yaml:"verify_after_restart,omitempty"`
+}
+
 type RecoveryFindingStatus string
 
 const (

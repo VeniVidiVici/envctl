@@ -262,6 +262,13 @@ launch_guided_setup() {
 		"$ENVCTL_BINARY" "$ENV_CONFIG_CHECKOUT"
 }
 
+print_bootstrap_locations() {
+	printf 'envctl:    %s\n' "$ENVCTL_BINARY"
+	printf 'code:      %s\n' "$ENVCTL_CHECKOUT"
+	printf 'config:    %s\n' "$ENV_CONFIG_CHECKOUT"
+	printf 'inventory: %s\n' "$BOOTSTRAP_STATE/initial-audit.json"
+}
+
 main() {
 	require_regular_file "$RECOVERY_AGE_IDENTITY"
 	require_regular_file "$RECOVERY_DEPLOY_KEY"
@@ -281,14 +288,28 @@ main() {
 		true
 	build_envctl
 	verify_foundation
-	launch_guided_setup
 
-	printf '\nBootstrap command complete.\n'
-	printf 'envctl:    %s\n' "$ENVCTL_BINARY"
-	printf 'code:      %s\n' "$ENVCTL_CHECKOUT"
-	printf 'config:    %s\n' "$ENV_CONFIG_CHECKOUT"
-	printf 'inventory: %s\n' "$BOOTSTRAP_STATE/initial-audit.json"
-	printf '\nDesired-state changes were made only through confirmed setup phases.\n'
+	local reboot_checkpoint="$BOOTSTRAP_STATE/reboot-checkpoint.json"
+	if [[ -f "$reboot_checkpoint" ]]; then
+		log "Resuming post-restart bootstrap verification"
+		"$ENVCTL_BINARY" bootstrap verify \
+			--config "$ENV_CONFIG_CHECKOUT"
+		printf '\nBootstrap command complete.\n'
+		print_bootstrap_locations
+		printf '\nDesired state and post-restart health checks are verified.\n'
+		return
+	fi
+
+	launch_guided_setup
+	if ! interactive_terminal; then
+		return
+	fi
+
+	printf '\n'
+	"$ENVCTL_BINARY" bootstrap checkpoint \
+		--config "$ENV_CONFIG_CHECKOUT"
+	printf '\nBootstrap is paused at the restart checkpoint.\n'
+	print_bootstrap_locations
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then

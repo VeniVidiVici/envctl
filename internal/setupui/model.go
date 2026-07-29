@@ -21,6 +21,7 @@ const (
 	PhaseMise     PhaseID = "mise"
 	PhaseBun      PhaseID = "bun"
 	PhaseCustom   PhaseID = "custom"
+	PhaseApps     PhaseID = "app-settings"
 	PhaseMAS      PhaseID = "mas"
 	PhaseManual   PhaseID = "manual"
 )

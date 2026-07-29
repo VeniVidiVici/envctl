@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/VeniVidiVici/envctl/internal/model"
 )
 
 func TestLoadResolvesNativeConfiguration(t *testing.T) {
@@ -101,6 +103,58 @@ surprise: true
 	_, err := Load(root, "example")
 	if err == nil || !strings.Contains(err.Error(), "field surprise") {
 		t.Fatalf("Load() error = %v, want unknown field error", err)
+	}
+}
+
+func TestLoadValidatesAndResolvesTypedAppSetting(t *testing.T) {
+	root := t.TempDir()
+	writeConfigFile(t, root, "envctl.yaml", `
+version: 1
+catalog: catalog.yaml
+profiles: profiles
+machines: machines
+`)
+	writeConfigFile(t, root, "catalog.yaml", `
+version: 1
+packages:
+  tailscale-app:
+    manager: brew
+    kind: cask
+    source: homebrew/cask
+    package: tailscale-app
+    update_policy: install-only
+app_settings:
+  tailscale-start-on-login:
+    kind: tailscale-start-on-login
+    package_id: tailscale-app
+    verify_after_restart: true
+`)
+	writeConfigFile(t, root, "profiles/base.yaml", `
+version: 1
+name: base
+packages:
+  - tailscale-app
+app_settings:
+  - tailscale-start-on-login
+`)
+	writeConfigFile(t, root, "machines/example.yaml", `
+version: 1
+id: example
+profiles:
+  - base
+access:
+  type: local
+`)
+
+	got, err := Load(root, "example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Desired.AppSettings) != 1 ||
+		got.Desired.AppSettings[0].Kind !=
+			model.AppSettingTailscaleStartOnLogin ||
+		!got.Desired.AppSettings[0].VerifyAfterRestart {
+		t.Fatalf("app settings = %#v", got.Desired.AppSettings)
 	}
 }
 

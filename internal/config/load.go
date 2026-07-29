@@ -543,6 +543,41 @@ func validateCatalog(root string, catalog *Catalog) error {
 		recoveryTargets[cleanedTarget] = id
 		catalog.Recoveries[id] = item
 	}
+	for id, item := range catalog.AppSettings {
+		if !safeIdentifier(id) {
+			return fmt.Errorf("catalog app setting has unsafe id %q", id)
+		}
+		if item.ID != "" && item.ID != id {
+			return fmt.Errorf(
+				"catalog app setting %q declares mismatched id %q", id, item.ID,
+			)
+		}
+		item.ID = id
+		switch item.Kind {
+		case model.AppSettingTailscaleStartOnLogin:
+		default:
+			return fmt.Errorf(
+				"catalog app setting %q has unsupported kind %q", id, item.Kind,
+			)
+		}
+		pkg, ok := catalog.Packages[item.PackageID]
+		if !ok {
+			return fmt.Errorf(
+				"catalog app setting %q references unknown package %q",
+				id,
+				item.PackageID,
+			)
+		}
+		if item.Kind == model.AppSettingTailscaleStartOnLogin &&
+			(pkg.Manager != model.ManagerBrew || pkg.Kind != model.KindCask ||
+				pkg.Package != "tailscale-app") {
+			return fmt.Errorf(
+				"catalog app setting %q must reference the tailscale-app Homebrew cask",
+				id,
+			)
+		}
+		catalog.AppSettings[id] = item
+	}
 	return nil
 }
 

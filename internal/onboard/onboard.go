@@ -175,6 +175,22 @@ func Resolve(
 		proposal.Remove = append([]string(nil), existing.Remove...)
 		proposal.AddLinks = append([]string(nil), existing.AddLinks...)
 		proposal.RemoveLinks = append([]string(nil), existing.RemoveLinks...)
+		proposal.AddRecoveries = append(
+			[]string(nil),
+			existing.AddRecoveries...,
+		)
+		proposal.RemoveRecoveries = append(
+			[]string(nil),
+			existing.RemoveRecoveries...,
+		)
+		proposal.AddAppSettings = append(
+			[]string(nil),
+			existing.AddAppSettings...,
+		)
+		proposal.RemoveAppSettings = append(
+			[]string(nil),
+			existing.RemoveAppSettings...,
+		)
 		proposal.Access = existing.Access
 		result.Proposal = &proposal
 		return result, nil

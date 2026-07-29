@@ -16,6 +16,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/VeniVidiVici/envctl/internal/appsetting"
+	"github.com/VeniVidiVici/envctl/internal/bootstrapverify"
 	"github.com/VeniVidiVici/envctl/internal/bun"
 	envconfig "github.com/VeniVidiVici/envctl/internal/config"
 	"github.com/VeniVidiVici/envctl/internal/customtool"
@@ -55,6 +57,9 @@ Usage:
   envctl plan (--config DIR --machine ID | --legacy PATH) --json [--inventory PATH]
   envctl apply --config DIR --machine ID [--local] [--manager brew|mise|bun|custom|mas] --json (--dry-run | --yes)
   envctl links apply --config DIR --machine ID --local --json (--dry-run | --yes)
+  envctl app-settings apply --config DIR --machine ID --local --json (--dry-run | --yes)
+  envctl bootstrap checkpoint --config DIR [--machine ID] [--json]
+  envctl bootstrap verify --config DIR [--machine ID] [--json]
   envctl recovery plan --config DIR --machine ID --local --json
   envctl recovery apply --config DIR --machine ID --local --json (--dry-run | --yes)
   envctl history --json [--state PATH] [--limit N]
@@ -100,6 +105,10 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runApply(ctx, args[1:], stdout, stderr)
 	case "links":
 		return runLinks(ctx, args[1:], stdout, stderr)
+	case "app-settings":
+		return runAppSettings(ctx, args[1:], stdout, stderr)
+	case "bootstrap":
+		return runBootstrap(ctx, args[1:], stdout, stderr)
 	case "recovery":
 		return runRecovery(ctx, args[1:], stdout, stderr)
 	case "config":
@@ -281,71 +290,126 @@ func buildSetupPhases(
 		loaded.Desired.Links,
 		inventory,
 	)
-	phases := []setupui.Phase{recoveryPhase, linkPhase}
-	phases = append(
-		phases,
-		buildManagerSetupPhase(
-			loaded,
-			inventory,
-			packagePlan,
-			model.ManagerBrew,
-			setupui.PhaseHomebrew,
-			"Homebrew packages",
-			"Install missing declared formulae and casks.",
-			[]setupui.PhaseID{setupui.PhaseRecovery, setupui.PhaseLinks},
-			true,
-		),
-		buildManagerSetupPhase(
-			loaded,
-			inventory,
-			packagePlan,
-			model.ManagerMise,
-			setupui.PhaseMise,
-			"Mise runtimes",
-			"Install declared runtimes before language-level tools.",
-			[]setupui.PhaseID{
-				setupui.PhaseRecovery,
-				setupui.PhaseLinks,
-				setupui.PhaseHomebrew,
-			},
-			true,
-		),
-		buildManagerSetupPhase(
-			loaded,
-			inventory,
-			packagePlan,
-			model.ManagerBun,
-			setupui.PhaseBun,
-			"Bun global tools",
-			"Install declared global tools after Homebrew prerequisites.",
-			[]setupui.PhaseID{setupui.PhaseMise},
-			true,
-		),
-		buildManagerSetupPhase(
-			loaded,
-			inventory,
-			packagePlan,
-			model.ManagerCustom,
-			setupui.PhaseCustom,
-			"Custom tools",
-			"Install missing tools through envctl's fixed, reviewed installer registry.",
-			[]setupui.PhaseID{setupui.PhaseHomebrew},
-			true,
-		),
-		buildManagerSetupPhase(
-			loaded,
-			inventory,
-			packagePlan,
-			model.ManagerMAS,
-			setupui.PhaseMAS,
-			"Mac App Store apps",
-			"Install free and already-owned apps; defer purchases and incompatible apps.",
-			[]setupui.PhaseID{setupui.PhaseHomebrew},
-			true,
-		),
-		buildManualSetupPhase(packagePlan),
+	homebrewPhase := buildManagerSetupPhase(
+		loaded,
+		inventory,
+		packagePlan,
+		model.ManagerBrew,
+		setupui.PhaseHomebrew,
+		"Homebrew packages",
+		"Install missing declared formulae and casks.",
+		[]setupui.PhaseID{setupui.PhaseRecovery},
+		true,
 	)
+	misePhase := buildManagerSetupPhase(
+		loaded,
+		inventory,
+		packagePlan,
+		model.ManagerMise,
+		setupui.PhaseMise,
+		"Mise runtimes",
+		"Install declared runtimes before language-level tools.",
+		[]setupui.PhaseID{
+			setupui.PhaseRecovery,
+			setupui.PhaseHomebrew,
+		},
+		true,
+	)
+	bunPhase := buildManagerSetupPhase(
+		loaded,
+		inventory,
+		packagePlan,
+		model.ManagerBun,
+		setupui.PhaseBun,
+		"Bun global tools",
+		"Install declared global tools after Homebrew prerequisites.",
+		[]setupui.PhaseID{setupui.PhaseMise},
+		true,
+	)
+	customPhase := buildManagerSetupPhase(
+		loaded,
+		inventory,
+		packagePlan,
+		model.ManagerCustom,
+		setupui.PhaseCustom,
+		"Custom tools",
+		"Install missing tools through envctl's fixed, reviewed installer registry.",
+		[]setupui.PhaseID{setupui.PhaseHomebrew},
+		true,
+	)
+	appPhase := buildAppSettingsSetupPhase(ctx, loaded)
+	linkPhase.Dependencies = []setupui.PhaseID{
+		setupui.PhaseRecovery,
+		setupui.PhaseHomebrew,
+		setupui.PhaseMise,
+		setupui.PhaseBun,
+		setupui.PhaseCustom,
+		setupui.PhaseApps,
+	}
+	masPhase := buildManagerSetupPhase(
+		loaded,
+		inventory,
+		packagePlan,
+		model.ManagerMAS,
+		setupui.PhaseMAS,
+		"Mac App Store apps",
+		"Install free and already-owned apps; defer purchases and incompatible apps.",
+		[]setupui.PhaseID{setupui.PhaseHomebrew},
+		true,
+	)
+	phases := []setupui.Phase{
+		recoveryPhase,
+		homebrewPhase,
+		misePhase,
+		bunPhase,
+		customPhase,
+		appPhase,
+		linkPhase,
+		masPhase,
+		buildManualSetupPhase(packagePlan),
+	}
 	return phases, nil
+}
+
+func buildAppSettingsSetupPhase(
+	ctx context.Context,
+	loaded envconfig.Loaded,
+) setupui.Phase {
+	phase := setupui.Phase{
+		ID:           setupui.PhaseApps,
+		Label:        "App startup settings",
+		Description:  "Apply reviewed startup settings for declared applications.",
+		Status:       setupui.StatusSatisfied,
+		Dependencies: []setupui.PhaseID{setupui.PhaseHomebrew},
+	}
+	if len(loaded.Desired.AppSettings) == 0 {
+		phase.Description = "No application startup settings are declared."
+		return phase
+	}
+	plan := appsetting.New(nil).Plan(ctx, loaded.Desired.AppSettings)
+	phase.Actions = len(plan.Actions)
+	phase.Blockers = len(plan.Blockers)
+	for _, blocker := range plan.Blockers {
+		phase.Diagnostics = append(
+			phase.Diagnostics,
+			blocker.ID+": "+blocker.Detail,
+		)
+	}
+	switch {
+	case !plan.Ready:
+		phase.Status = setupui.StatusBlocked
+	case len(plan.Actions) > 0:
+		phase.Status = setupui.StatusReady
+		phase.Command = []string{
+			"app-settings", "apply",
+			"--config", loaded.Root,
+			"--machine", loaded.Machine.ID,
+			"--local",
+			"--json",
+			"--yes",
+		}
+	}
+	return phase
 }
 
 func buildRecoverySetupPhase(
@@ -1172,6 +1236,659 @@ type linkApplyResponse struct {
 	RunID                  string                          `json:"run_id,omitempty"`
 	PlanID                 string                          `json:"plan_id,omitempty"`
 	VerificationSnapshotID string                          `json:"verification_snapshot_id,omitempty"`
+}
+
+type appSettingsApplyResponse struct {
+	Mode         string             `json:"mode"`
+	MachineID    string             `json:"machine_id"`
+	ConfigDigest string             `json:"config_digest"`
+	Plan         appsetting.Plan    `json:"plan"`
+	Result       *appsetting.Result `json:"result,omitempty"`
+}
+
+type bootstrapCheckpointResponse struct {
+	MachineID       string                     `json:"machine_id"`
+	ConfigDigest    string                     `json:"config_digest"`
+	CheckpointPath  string                     `json:"checkpoint_path"`
+	Checkpoint      bootstrapverify.Checkpoint `json:"checkpoint"`
+	Checks          []bootstrapverify.Check    `json:"checks"`
+	Ready           bool                       `json:"ready"`
+	RestartRequired bool                       `json:"restart_required"`
+}
+
+type combinedOutputRunner struct{}
+
+func (combinedOutputRunner) Run(
+	ctx context.Context,
+	name string,
+	args ...string,
+) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+func runBootstrap(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	if len(args) == 0 {
+		return errors.New(
+			"usage: envctl bootstrap (checkpoint | verify) " +
+				"[--config DIR] [--machine ID] [--json]",
+		)
+	}
+	switch args[0] {
+	case "checkpoint":
+		return runBootstrapCheckpoint(ctx, args[1:], stdout, stderr)
+	case "verify":
+		return runBootstrapVerify(ctx, args[1:], stdout, stderr)
+	default:
+		return errors.New(
+			"usage: envctl bootstrap (checkpoint | verify) " +
+				"[--config DIR] [--machine ID] [--json]",
+		)
+	}
+}
+
+func runBootstrapCheckpoint(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("bootstrap checkpoint", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String(
+		"config", "", "native env-config directory; defaults to the standard checkout",
+	)
+	machineID := flags.String(
+		"machine", "", "machine id; defaults to this Mac's registered identity",
+	)
+	asJSON := flags.Bool("json", false, "print the checkpoint as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("bootstrap checkpoint accepts no positional arguments")
+	}
+	loaded, err := loadLocalBootstrapMachine(ctx, *configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	checks, ready, err := bootstrapCoreChecks(ctx, loaded)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return errors.New(
+			"bootstrap core setup is incomplete; finish the failed or pending setup phases before checkpointing",
+		)
+	}
+	bootID, err := bootstrapverify.CurrentBootID(ctx, combinedOutputRunner{})
+	if err != nil {
+		return err
+	}
+	path, err := bootstrapCheckpointPath()
+	if err != nil {
+		return err
+	}
+	checkpoint := bootstrapverify.Checkpoint{
+		MachineID:    loaded.Machine.ID,
+		ConfigDigest: loaded.Digest,
+		BootID:       bootID,
+		CreatedAt:    time.Now().UTC(),
+	}
+	if existing, loadErr := bootstrapverify.Load(path); loadErr == nil &&
+		existing.MachineID == checkpoint.MachineID &&
+		existing.ConfigDigest == checkpoint.ConfigDigest &&
+		existing.BootID == checkpoint.BootID &&
+		existing.VerifiedAt == nil {
+		checkpoint = existing
+	}
+	if err := bootstrapverify.SaveCheckpoint(path, checkpoint); err != nil {
+		return err
+	}
+	response := bootstrapCheckpointResponse{
+		MachineID:       loaded.Machine.ID,
+		ConfigDigest:    loaded.Digest,
+		CheckpointPath:  path,
+		Checkpoint:      checkpoint,
+		Checks:          checks,
+		Ready:           true,
+		RestartRequired: true,
+	}
+	if *asJSON {
+		return encodeJSON(stdout, response)
+	}
+	fmt.Fprintf(
+		stdout,
+		"Bootstrap setup is ready for restart verification on %s.\n",
+		loaded.Machine.ID,
+	)
+	printBootstrapChecks(stdout, checks)
+	fmt.Fprintln(stdout)
+	fmt.Fprintln(
+		stdout,
+		"Restart this Mac, then rerun the same bootstrap command.",
+	)
+	fmt.Fprintf(stdout, "Checkpoint: %s\n", path)
+	return nil
+}
+
+func runBootstrapVerify(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	flags := flag.NewFlagSet("bootstrap verify", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String(
+		"config", "", "native env-config directory; defaults to the standard checkout",
+	)
+	machineID := flags.String(
+		"machine", "", "machine id; defaults to this Mac's registered identity",
+	)
+	asJSON := flags.Bool("json", false, "print the verification report as JSON")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("bootstrap verify accepts no positional arguments")
+	}
+	loaded, err := loadLocalBootstrapMachine(ctx, *configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	checkpointPath, err := bootstrapCheckpointPath()
+	if err != nil {
+		return err
+	}
+	checkpoint, err := bootstrapverify.Load(checkpointPath)
+	if err != nil {
+		return err
+	}
+	currentBootID, err := bootstrapverify.CurrentBootID(
+		ctx,
+		combinedOutputRunner{},
+	)
+	if err != nil {
+		return err
+	}
+	report := bootstrapverify.Report{
+		MachineID:      loaded.Machine.ID,
+		ConfigDigest:   loaded.Digest,
+		CheckpointPath: checkpointPath,
+		PreviousBootID: checkpoint.BootID,
+		CurrentBootID:  currentBootID,
+		Restarted:      checkpoint.BootID != currentBootID,
+		VerifiedAt:     time.Now().UTC(),
+	}
+	report.Checks = append(report.Checks, bootstrapverify.Check{
+		ID:     "restart-observed",
+		Status: boolCheckStatus(report.Restarted),
+		Detail: boolDetail(
+			report.Restarted,
+			"the Mac restarted after the bootstrap checkpoint",
+			"the Mac has not restarted since the bootstrap checkpoint",
+		),
+	})
+	sameMachine := checkpoint.MachineID == loaded.Machine.ID
+	report.Checks = append(report.Checks, bootstrapverify.Check{
+		ID:     "machine-identity",
+		Status: boolCheckStatus(sameMachine),
+		Detail: boolDetail(
+			sameMachine,
+			"checkpoint belongs to "+loaded.Machine.ID,
+			fmt.Sprintf(
+				"checkpoint belongs to %q, not %q",
+				checkpoint.MachineID,
+				loaded.Machine.ID,
+			),
+		),
+	})
+	sameConfig := checkpoint.ConfigDigest == loaded.Digest
+	report.Checks = append(report.Checks, bootstrapverify.Check{
+		ID:     "config-digest",
+		Status: boolCheckStatus(sameConfig),
+		Detail: boolDetail(
+			sameConfig,
+			"configuration is unchanged since the checkpoint",
+			"configuration changed after the checkpoint; apply it and create a new checkpoint",
+		),
+	})
+	coreChecks, _, coreErr := bootstrapCoreChecks(ctx, loaded)
+	if coreErr != nil {
+		report.Checks = append(report.Checks, bootstrapverify.Check{
+			ID: "core-setup", Status: bootstrapverify.StatusFailed,
+			Detail: coreErr.Error(),
+		})
+	} else {
+		report.Checks = append(report.Checks, coreChecks...)
+	}
+	for _, check := range appsetting.New(nil).VerifyAfterRestart(
+		ctx,
+		loaded.Desired.AppSettings,
+	) {
+		report.Checks = append(report.Checks, bootstrapverify.Check{
+			ID:     check.ID,
+			Status: boolCheckStatus(check.Passed),
+			Detail: check.Detail,
+		})
+	}
+	report.Checks = append(
+		report.Checks,
+		bootstrapLegacyCheck(loaded),
+		bootstrapGitCheck(ctx, loaded),
+		bootstrapShellCheck(ctx, loaded),
+	)
+	report.Ready = true
+	for _, check := range report.Checks {
+		if check.Status == bootstrapverify.StatusFailed {
+			report.Ready = false
+			break
+		}
+	}
+	reportPath := filepath.Join(
+		filepath.Dir(checkpointPath),
+		"verification-report.json",
+	)
+	if err := bootstrapverify.SaveReport(reportPath, report); err != nil {
+		return err
+	}
+	if report.Ready {
+		verifiedAt := report.VerifiedAt
+		checkpoint.VerifiedAt = &verifiedAt
+		if err := bootstrapverify.SaveCheckpoint(
+			checkpointPath,
+			checkpoint,
+		); err != nil {
+			return err
+		}
+	}
+	if *asJSON {
+		if err := encodeJSON(stdout, report); err != nil {
+			return err
+		}
+	} else {
+		fmt.Fprintf(
+			stdout,
+			"Post-restart bootstrap verification for %s\n",
+			loaded.Machine.ID,
+		)
+		printBootstrapChecks(stdout, report.Checks)
+		fmt.Fprintf(stdout, "\nReport: %s\n", reportPath)
+	}
+	if !report.Ready {
+		return errors.New(
+			"post-restart bootstrap verification failed; the checkpoint was kept for a retry",
+		)
+	}
+	if !*asJSON {
+		fmt.Fprintln(stdout, "Bootstrap verified and complete.")
+	}
+	return nil
+}
+
+func loadLocalBootstrapMachine(
+	ctx context.Context,
+	configRoot, machineID string,
+) (envconfig.Loaded, error) {
+	resolvedRoot, err := resolveConfigRoot(configRoot)
+	if err != nil {
+		return envconfig.Loaded{}, err
+	}
+	resolvedID := machineID
+	if resolvedID == "" {
+		machines, err := envconfig.Machines(resolvedRoot)
+		if err != nil {
+			return envconfig.Loaded{}, err
+		}
+		profiles, err := envconfig.ProfileNames(resolvedRoot)
+		if err != nil {
+			return envconfig.Loaded{}, err
+		}
+		identity, err := onboard.Detect(ctx)
+		if err != nil {
+			return envconfig.Loaded{}, err
+		}
+		result, err := onboard.Resolve(identity, machines, profiles, "", nil)
+		if err != nil {
+			return envconfig.Loaded{}, err
+		}
+		if result.Status != onboard.StatusMatched {
+			return envconfig.Loaded{}, errors.New(
+				"this Mac is not registered; run envctl onboard first",
+			)
+		}
+		resolvedID = result.MachineID
+	}
+	loaded, err := envconfig.Load(resolvedRoot, resolvedID)
+	if err != nil {
+		return envconfig.Loaded{}, err
+	}
+	if err := forceLocalMachine(ctx, &loaded); err != nil {
+		return envconfig.Loaded{}, err
+	}
+	return loaded, nil
+}
+
+func bootstrapCoreChecks(
+	ctx context.Context,
+	loaded envconfig.Loaded,
+) ([]bootstrapverify.Check, bool, error) {
+	phases, err := buildSetupPhases(ctx, loaded)
+	if err != nil {
+		return nil, false, err
+	}
+	ready := true
+	checks := make([]bootstrapverify.Check, 0, len(phases))
+	for _, phase := range phases {
+		status := bootstrapverify.StatusPassed
+		detail := phase.Label + " is satisfied"
+		switch phase.ID {
+		case setupui.PhaseMAS, setupui.PhaseManual:
+			if phase.Status != setupui.StatusSatisfied {
+				status = bootstrapverify.StatusWarned
+				detail = fmt.Sprintf(
+					"%s has %d manual or deferred action(s)",
+					phase.Label,
+					phase.Actions,
+				)
+			}
+		default:
+			if phase.Status != setupui.StatusSatisfied {
+				status = bootstrapverify.StatusFailed
+				ready = false
+				detail = fmt.Sprintf(
+					"%s is %s with %d action(s) and %d blocker(s)",
+					phase.Label,
+					phase.Status,
+					phase.Actions,
+					phase.Blockers,
+				)
+			}
+		}
+		checks = append(checks, bootstrapverify.Check{
+			ID: "phase." + string(phase.ID), Status: status, Detail: detail,
+		})
+	}
+	return checks, ready, nil
+}
+
+func bootstrapLegacyCheck(loaded envconfig.Loaded) bootstrapverify.Check {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return bootstrapverify.Check{
+			ID: "legacy-independence", Status: bootstrapverify.StatusFailed,
+			Detail: err.Error(),
+		}
+	}
+	auditor, err := legacydeps.New(
+		home,
+		filepath.Join(home, "Documents", "env"),
+		loaded.Root,
+	)
+	if err != nil {
+		return bootstrapverify.Check{
+			ID: "legacy-independence", Status: bootstrapverify.StatusFailed,
+			Detail: err.Error(),
+		}
+	}
+	report, err := auditor.Audit()
+	if err != nil {
+		return bootstrapverify.Check{
+			ID: "legacy-independence", Status: bootstrapverify.StatusFailed,
+			Detail: err.Error(),
+		}
+	}
+	return bootstrapverify.Check{
+		ID:     "legacy-independence",
+		Status: boolCheckStatus(report.Ready),
+		Detail: boolDetail(
+			report.Ready,
+			"no active configuration depends on ~/Documents/env",
+			fmt.Sprintf(
+				"%d active path(s) still depend on ~/Documents/env",
+				report.Dependencies,
+			),
+		),
+	}
+}
+
+func bootstrapGitCheck(
+	ctx context.Context,
+	loaded envconfig.Loaded,
+) bootstrapverify.Check {
+	output, err := (combinedOutputRunner{}).Run(
+		ctx,
+		"/usr/bin/env",
+		"git",
+		"-C",
+		loaded.Root,
+		"ls-remote",
+		"origin",
+		"HEAD",
+	)
+	passed := err == nil && strings.TrimSpace(string(output)) != ""
+	detail := "private env-config Git access works without an SSH agent"
+	if !passed {
+		detail = commandFailureDetail("verify private env-config Git access", output, err)
+	}
+	return bootstrapverify.Check{
+		ID: "private-config-git", Status: boolCheckStatus(passed), Detail: detail,
+	}
+}
+
+func bootstrapShellCheck(
+	ctx context.Context,
+	loaded envconfig.Loaded,
+) bootstrapverify.Check {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return bootstrapverify.Check{
+			ID: "clean-login-shell", Status: bootstrapverify.StatusFailed,
+			Detail: err.Error(),
+		}
+	}
+	user := os.Getenv("USER")
+	if user == "" {
+		user = filepath.Base(home)
+	}
+	const marker = "__ENVCTL_SHELL_OK__"
+	const shellTest = `test -n "$ENV_CONFIG_HOME" &&
+test "$ENV_CONFIG_HOME" = "$HOME/.local/share/envctl/repos/env-config" &&
+typeset -f zinit >/dev/null &&
+command -v fzf >/dev/null &&
+command -v oh-my-posh >/dev/null &&
+test -n "$PROMPT" &&
+case "$ENV_CONFIG_HOME:$PATH" in *"$HOME/Documents/env"*) false;; *) true;; esac &&
+printf __ENVCTL_SHELL_OK__`
+	output, runErr := (combinedOutputRunner{}).Run(
+		ctx,
+		"/usr/bin/script",
+		"-q",
+		"/dev/null",
+		"/usr/bin/env",
+		"-i",
+		"HOME="+home,
+		"USER="+user,
+		"LOGNAME="+user,
+		"TERM=xterm-256color",
+		"PATH="+filepath.Join(home, ".local", "bin")+
+			":/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+		"/bin/zsh",
+		"-lic",
+		shellTest,
+	)
+	normalizedOutput := strings.ReplaceAll(string(output), "^D\b\b", "")
+	passed := runErr == nil &&
+		strings.TrimSpace(normalizedOutput) == marker
+	detail := "a clean interactive login shell starts quietly with the managed prompt"
+	if !passed {
+		detail = commandFailureDetail("verify clean login shell", output, runErr)
+	}
+	return bootstrapverify.Check{
+		ID: "clean-login-shell", Status: boolCheckStatus(passed), Detail: detail,
+	}
+}
+
+func bootstrapCheckpointPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("find home directory: %w", err)
+	}
+	return filepath.Join(
+		home,
+		".local",
+		"state",
+		"envctl",
+		"bootstrap",
+		"reboot-checkpoint.json",
+	), nil
+}
+
+func boolCheckStatus(passed bool) bootstrapverify.CheckStatus {
+	if passed {
+		return bootstrapverify.StatusPassed
+	}
+	return bootstrapverify.StatusFailed
+}
+
+func boolDetail(condition bool, passed, failed string) string {
+	if condition {
+		return passed
+	}
+	return failed
+}
+
+func commandFailureDetail(action string, output []byte, err error) string {
+	detail := strings.TrimSpace(string(output))
+	if err == nil {
+		err = errors.New("unexpected output")
+	}
+	if detail == "" {
+		return fmt.Sprintf("%s: %v", action, err)
+	}
+	const maxDetail = 500
+	if len(detail) > maxDetail {
+		detail = detail[:maxDetail] + "..."
+	}
+	return fmt.Sprintf("%s: %v: %s", action, err, detail)
+}
+
+func printBootstrapChecks(
+	writer io.Writer,
+	checks []bootstrapverify.Check,
+) {
+	for _, check := range checks {
+		symbol := "✓"
+		switch check.Status {
+		case bootstrapverify.StatusWarned:
+			symbol = "!"
+		case bootstrapverify.StatusFailed:
+			symbol = "✗"
+		}
+		fmt.Fprintf(writer, "  %s %s: %s\n", symbol, check.ID, check.Detail)
+	}
+}
+
+func runAppSettings(
+	ctx context.Context,
+	args []string,
+	stdout, stderr io.Writer,
+) error {
+	if len(args) == 0 || args[0] != "apply" {
+		return errors.New(
+			"usage: envctl app-settings apply --config DIR --machine ID " +
+				"--local --json (--dry-run | --yes)",
+		)
+	}
+	flags := flag.NewFlagSet("app-settings apply", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	configRoot := flags.String("config", "", "native env-config directory")
+	machineID := flags.String("machine", "", "machine id from the native config")
+	localMachine := flags.Bool(
+		"local", false,
+		"require this Mac's registered identity and execute locally",
+	)
+	dryRun := flags.Bool(
+		"dry-run", false,
+		"print the setting transaction without changing preferences",
+	)
+	yes := flags.Bool(
+		"yes", false,
+		"confirm the validated application-setting transaction",
+	)
+	asJSON := flags.Bool(
+		"json", false,
+		"print the application-setting transaction as JSON",
+	)
+	if err := flags.Parse(args[1:]); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("app-settings apply accepts no positional arguments")
+	}
+	if *configRoot == "" || *machineID == "" {
+		return errors.New("--config and --machine are required")
+	}
+	if !*localMachine {
+		return errors.New("application-setting apply currently requires --local")
+	}
+	if !*asJSON {
+		return errors.New("application-setting apply currently requires --json")
+	}
+	if *dryRun == *yes {
+		return errors.New("exactly one of --dry-run or --yes is required")
+	}
+	loaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return err
+	}
+	if err := forceLocalMachine(ctx, &loaded); err != nil {
+		return err
+	}
+	if len(loaded.Desired.AppSettings) == 0 {
+		return errors.New("machine has no desired application settings")
+	}
+	manager := appsetting.New(nil)
+	plan := manager.Plan(ctx, loaded.Desired.AppSettings)
+	mode := "dry-run"
+	if *yes {
+		mode = "apply"
+	}
+	response := appSettingsApplyResponse{
+		Mode:         mode,
+		MachineID:    loaded.Machine.ID,
+		ConfigDigest: loaded.Digest,
+		Plan:         plan,
+	}
+	if *dryRun {
+		return encodeJSON(stdout, response)
+	}
+	if !plan.Ready {
+		return fmt.Errorf(
+			"refuse application-setting transaction with %d blocker(s)",
+			len(plan.Blockers),
+		)
+	}
+	reloaded, err := envconfig.Load(*configRoot, *machineID)
+	if err != nil {
+		return fmt.Errorf("reload configuration before app-setting apply: %w", err)
+	}
+	if err := forceLocalMachine(ctx, &reloaded); err != nil {
+		return err
+	}
+	if reloaded.Digest != loaded.Digest {
+		return errors.New(
+			"configuration changed during app-setting planning; rerun app-settings apply",
+		)
+	}
+	result, err := manager.Apply(ctx, reloaded.Desired.AppSettings)
+	response.Result = &result
+	if err != nil {
+		return err
+	}
+	return encodeJSON(stdout, response)
 }
 
 func runLinks(

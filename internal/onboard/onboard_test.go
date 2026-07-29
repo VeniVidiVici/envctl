@@ -82,7 +82,10 @@ func TestResolveExistingIDRequiresConfirmationAndPreservesOverlay(t *testing.T) 
 	}
 	machines := []envconfig.Machine{{
 		ID: "example-mac", Profiles: []string{"shared"}, Add: []string{"local-only"},
-		Access: envconfig.Access{Type: "local"},
+		AddRecoveries:     []string{"local-recovery"},
+		AddAppSettings:    []string{"local-setting"},
+		RemoveAppSettings: []string{"shared-setting"},
+		Access:            envconfig.Access{Type: "local"},
 	}}
 	got, err := Resolve(identity, machines, []string{"shared"}, "", nil)
 	if err != nil {
@@ -93,6 +96,9 @@ func TestResolveExistingIDRequiresConfirmationAndPreservesOverlay(t *testing.T) 
 	}
 	if got.Proposal == nil ||
 		strings.Join(got.Proposal.Add, ",") != "local-only" ||
+		strings.Join(got.Proposal.AddRecoveries, ",") != "local-recovery" ||
+		strings.Join(got.Proposal.AddAppSettings, ",") != "local-setting" ||
+		strings.Join(got.Proposal.RemoveAppSettings, ",") != "shared-setting" ||
 		got.Proposal.Access.Type != "local" {
 		t.Fatalf("proposal = %#v", got.Proposal)
 	}

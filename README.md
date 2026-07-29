@@ -72,12 +72,14 @@ envctl setup \
   --local
 ```
 
-Setup presents credential recovery, portable links, Homebrew, Mise, Bun,
-fixed-registry custom tools, Mac App Store apps, and explicitly manual tools
-as ordered phases. Each executable phase launches the existing scoped envctl
-transaction in a child process, so it replans against live state, asks for
-confirmation, journals mutations, and verifies the result. `--json` prints the
-same phase plan without changing state.
+Setup presents credential recovery, Homebrew, Mise, Bun, fixed-registry custom
+tools, reviewed application startup settings, portable links, Mac App Store
+apps, and explicitly manual tools as ordered phases. Portable shell
+configuration cannot activate until its package, runtime, and tool
+prerequisites are satisfied. Each executable phase launches the existing
+scoped envctl transaction in a child process, so it replans against live state,
+asks for confirmation, journals mutations where applicable, and verifies the
+result. `--json` prints the same phase plan without changing state.
 
 For clean-account child processes, envctl defaults `XDG_CONFIG_HOME` to
 `~/.config` when it is otherwise unset. An explicit caller value is preserved.
@@ -131,6 +133,22 @@ it blocks an existing keyring missing that key for manual review. SQLite records
 paths, statuses, and action history, but never plaintext or secret content
 digests.
 
+Application startup settings use fixed compiled-in drivers rather than
+configuration-supplied commands. They can be inspected separately with a
+read-only transaction:
+
+```sh
+envctl app-settings apply \
+  --config /path/to/env-config \
+  --machine example-mac \
+  --local \
+  --dry-run \
+  --json
+```
+
+The initial driver enables Tailscale's own start-on-login preference and opens
+the installed app once so macOS can register its login-item helper.
+
 For a clean Mac, `scripts/bootstrap-macos` is the versioned bootstrap
 foundation. It expects the age identity and encrypted read-only `env-config`
 deploy key in iCloud's `Env Secrets` directory. It installs only the tools
@@ -139,10 +157,17 @@ config, and records an initial read-only audit. In an interactive terminal, the
 same command asks for the machine ID and profiles, registers the machine
 locally, and continues directly into ordered guided setup. Selecting the machine
 and profiles authorizes executable setup phases; the workflow stops on the
-first blocker or failure. In a noninteractive terminal, it prints the exact
-interactive command to run later. A rerun preserves an
-onboarding-created machine file when the private checkout has not advanced
-upstream.
+first blocker or failure. It then writes a reboot checkpoint and pauses rather
+than claiming completion. After restarting, rerun the same bootstrap command;
+it verifies that the boot changed, setup remains converged, Tailscale returned
+online through its registered login helper, the private config repository is
+reachable without an SSH agent, a clean interactive zsh login is quiet and
+healthy, and active configuration no longer depends on `~/Documents/env`.
+Only then does it print `Bootstrap command complete`. Mac App Store purchases
+and explicitly manual tools remain visible warnings rather than being silently
+discarded. In a noninteractive terminal, it prints the exact interactive
+command to run later. A rerun preserves an onboarding-created machine file when
+the private checkout has not advanced upstream.
 
 Then launch the fleet review TUI with:
 
@@ -193,6 +218,10 @@ go run ./cmd/envctl recovery plan \
   --config ../env-config --machine example-mac --local --json
 go run ./cmd/envctl recovery apply \
   --config ../env-config --machine example-mac --local --dry-run --json
+go run ./cmd/envctl app-settings apply \
+  --config ../env-config --machine example-mac --local --dry-run --json
+go run ./cmd/envctl bootstrap checkpoint --config ../env-config
+go run ./cmd/envctl bootstrap verify --config ../env-config
 go run ./cmd/envctl config resolve \
   --config ./examples/env-config --machine example-mac --json
 go run ./cmd/envctl history --json

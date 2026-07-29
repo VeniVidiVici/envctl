@@ -21,6 +21,10 @@ func TestResolveComposesProfilesAndMachineOverlay(t *testing.T) {
 		"base-recovery":    {Kind: model.RecoveryKindSOPSFile},
 		"removed-recovery": {Kind: model.RecoveryKindSOPSFile},
 		"machine-recovery": {Kind: model.RecoveryKindSOPSFile},
+	}, AppSettings: map[string]model.AppSettingSpec{
+		"base-setting":    {Kind: model.AppSettingTailscaleStartOnLogin},
+		"removed-setting": {Kind: model.AppSettingTailscaleStartOnLogin},
+		"machine-setting": {Kind: model.AppSettingTailscaleStartOnLogin},
 	}}
 	profiles := map[string]Profile{
 		"base": {
@@ -31,6 +35,7 @@ func TestResolveComposesProfilesAndMachineOverlay(t *testing.T) {
 				"base-recovery",
 				"removed-recovery",
 			},
+			AppSettings: []string{"base-setting", "removed-setting"},
 		},
 		"development": {
 			Name:     "development",
@@ -51,6 +56,8 @@ func TestResolveComposesProfilesAndMachineOverlay(t *testing.T) {
 		RemoveRecoveries: []string{
 			"removed-recovery",
 		},
+		AddAppSettings:    []string{"machine-setting"},
+		RemoveAppSettings: []string{"removed-setting"},
 	}
 
 	got, err := Resolve(catalog, profiles, machine)
@@ -80,6 +87,13 @@ func TestResolveComposesProfilesAndMachineOverlay(t *testing.T) {
 	}
 	if strings.Join(recoveryIDs, ",") != "base-recovery,machine-recovery" {
 		t.Fatalf("resolved recoveries = %v", recoveryIDs)
+	}
+	var settingIDs []string
+	for _, item := range got.AppSettings {
+		settingIDs = append(settingIDs, item.ID)
+	}
+	if strings.Join(settingIDs, ",") != "base-setting,machine-setting" {
+		t.Fatalf("resolved app settings = %v", settingIDs)
 	}
 }
 

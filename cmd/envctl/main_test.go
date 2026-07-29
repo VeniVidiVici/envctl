@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -296,8 +297,30 @@ access:
 	if err := json.Unmarshal(stdout.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Phases) != 8 {
+	if len(response.Phases) != 9 {
 		t.Fatalf("phases = %#v", response.Phases)
+	}
+	wantOrder := []setupui.PhaseID{
+		setupui.PhaseRecovery,
+		setupui.PhaseHomebrew,
+		setupui.PhaseMise,
+		setupui.PhaseBun,
+		setupui.PhaseCustom,
+		setupui.PhaseApps,
+		setupui.PhaseLinks,
+		setupui.PhaseMAS,
+		setupui.PhaseManual,
+	}
+	for index, want := range wantOrder {
+		if response.Phases[index].ID != want {
+			t.Fatalf(
+				"phase %d = %q, want %q; phases = %#v",
+				index,
+				response.Phases[index].ID,
+				want,
+				response.Phases,
+			)
+		}
 	}
 	var links, manual setupui.Phase
 	for _, phase := range response.Phases {
@@ -310,6 +333,21 @@ access:
 	}
 	if links.Status != setupui.StatusReady || links.Actions != 1 {
 		t.Fatalf("link phase = %#v", links)
+	}
+	wantLinkDependencies := []setupui.PhaseID{
+		setupui.PhaseRecovery,
+		setupui.PhaseHomebrew,
+		setupui.PhaseMise,
+		setupui.PhaseBun,
+		setupui.PhaseCustom,
+		setupui.PhaseApps,
+	}
+	if !reflect.DeepEqual(links.Dependencies, wantLinkDependencies) {
+		t.Fatalf(
+			"link dependencies = %#v, want %#v",
+			links.Dependencies,
+			wantLinkDependencies,
+		)
 	}
 	if manual.Status != setupui.StatusBlocked || manual.Actions != 1 {
 		t.Fatalf("manual phase = %#v", manual)

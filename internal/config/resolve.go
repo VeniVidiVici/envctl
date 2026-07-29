@@ -8,30 +8,34 @@ import (
 )
 
 type Catalog struct {
-	Packages   map[string]model.PackageSpec  `json:"packages" yaml:"packages"`
-	Links      map[string]model.LinkSpec     `json:"links,omitempty" yaml:"links,omitempty"`
-	Recoveries map[string]model.RecoverySpec `json:"recoveries,omitempty" yaml:"recoveries,omitempty"`
+	Packages    map[string]model.PackageSpec    `json:"packages" yaml:"packages"`
+	Links       map[string]model.LinkSpec       `json:"links,omitempty" yaml:"links,omitempty"`
+	Recoveries  map[string]model.RecoverySpec   `json:"recoveries,omitempty" yaml:"recoveries,omitempty"`
+	AppSettings map[string]model.AppSettingSpec `json:"app_settings,omitempty" yaml:"app_settings,omitempty"`
 }
 
 type Profile struct {
-	Name       string   `json:"name" yaml:"name"`
-	Extends    []string `json:"extends,omitempty" yaml:"extends,omitempty"`
-	Packages   []string `json:"packages,omitempty" yaml:"packages,omitempty"`
-	Links      []string `json:"links,omitempty" yaml:"links,omitempty"`
-	Recoveries []string `json:"recoveries,omitempty" yaml:"recoveries,omitempty"`
+	Name        string   `json:"name" yaml:"name"`
+	Extends     []string `json:"extends,omitempty" yaml:"extends,omitempty"`
+	Packages    []string `json:"packages,omitempty" yaml:"packages,omitempty"`
+	Links       []string `json:"links,omitempty" yaml:"links,omitempty"`
+	Recoveries  []string `json:"recoveries,omitempty" yaml:"recoveries,omitempty"`
+	AppSettings []string `json:"app_settings,omitempty" yaml:"app_settings,omitempty"`
 }
 
 type Machine struct {
-	ID               string   `json:"id" yaml:"id"`
-	Match            Match    `json:"match,omitempty" yaml:"match,omitempty"`
-	Profiles         []string `json:"profiles" yaml:"profiles"`
-	Add              []string `json:"add,omitempty" yaml:"add,omitempty"`
-	Remove           []string `json:"remove,omitempty" yaml:"remove,omitempty"`
-	AddLinks         []string `json:"add_links,omitempty" yaml:"add_links,omitempty"`
-	RemoveLinks      []string `json:"remove_links,omitempty" yaml:"remove_links,omitempty"`
-	AddRecoveries    []string `json:"add_recoveries,omitempty" yaml:"add_recoveries,omitempty"`
-	RemoveRecoveries []string `json:"remove_recoveries,omitempty" yaml:"remove_recoveries,omitempty"`
-	Access           Access   `json:"access" yaml:"access"`
+	ID                string   `json:"id" yaml:"id"`
+	Match             Match    `json:"match,omitempty" yaml:"match,omitempty"`
+	Profiles          []string `json:"profiles" yaml:"profiles"`
+	Add               []string `json:"add,omitempty" yaml:"add,omitempty"`
+	Remove            []string `json:"remove,omitempty" yaml:"remove,omitempty"`
+	AddLinks          []string `json:"add_links,omitempty" yaml:"add_links,omitempty"`
+	RemoveLinks       []string `json:"remove_links,omitempty" yaml:"remove_links,omitempty"`
+	AddRecoveries     []string `json:"add_recoveries,omitempty" yaml:"add_recoveries,omitempty"`
+	RemoveRecoveries  []string `json:"remove_recoveries,omitempty" yaml:"remove_recoveries,omitempty"`
+	AddAppSettings    []string `json:"add_app_settings,omitempty" yaml:"add_app_settings,omitempty"`
+	RemoveAppSettings []string `json:"remove_app_settings,omitempty" yaml:"remove_app_settings,omitempty"`
+	Access            Access   `json:"access" yaml:"access"`
 }
 
 type Match struct {
@@ -44,17 +48,19 @@ type Access struct {
 }
 
 type DesiredState struct {
-	MachineID  string               `json:"machine_id"`
-	Profiles   []string             `json:"profiles"`
-	Packages   []model.PackageSpec  `json:"packages"`
-	Links      []model.LinkSpec     `json:"links,omitempty"`
-	Recoveries []model.RecoverySpec `json:"recoveries,omitempty"`
+	MachineID   string                 `json:"machine_id"`
+	Profiles    []string               `json:"profiles"`
+	Packages    []model.PackageSpec    `json:"packages"`
+	Links       []model.LinkSpec       `json:"links,omitempty"`
+	Recoveries  []model.RecoverySpec   `json:"recoveries,omitempty"`
+	AppSettings []model.AppSettingSpec `json:"app_settings,omitempty"`
 }
 
 func Resolve(catalog Catalog, profiles map[string]Profile, machine Machine) (DesiredState, error) {
 	selected := make(map[string]bool)
 	selectedLinks := make(map[string]bool)
 	selectedRecoveries := make(map[string]bool)
+	selectedAppSettings := make(map[string]bool)
 	var profileOrder []string
 	visiting := make(map[string]bool)
 	visited := make(map[string]bool)
@@ -101,6 +107,16 @@ func Resolve(catalog Catalog, profiles map[string]Profile, machine Machine) (Des
 				)
 			}
 			selectedRecoveries[recoveryID] = true
+		}
+		for _, settingID := range profile.AppSettings {
+			if _, ok := catalog.AppSettings[settingID]; !ok {
+				return fmt.Errorf(
+					"profile %q references unknown app setting %q",
+					name,
+					settingID,
+				)
+			}
+			selectedAppSettings[settingID] = true
 		}
 		return nil
 	}
@@ -154,6 +170,22 @@ func Resolve(catalog Catalog, profiles map[string]Profile, machine Machine) (Des
 		}
 		delete(selectedRecoveries, recoveryID)
 	}
+	for _, settingID := range machine.AddAppSettings {
+		if _, ok := catalog.AppSettings[settingID]; !ok {
+			return DesiredState{}, fmt.Errorf(
+				"machine %q adds unknown app setting %q", machine.ID, settingID,
+			)
+		}
+		selectedAppSettings[settingID] = true
+	}
+	for _, settingID := range machine.RemoveAppSettings {
+		if _, ok := catalog.AppSettings[settingID]; !ok {
+			return DesiredState{}, fmt.Errorf(
+				"machine %q removes unknown app setting %q", machine.ID, settingID,
+			)
+		}
+		delete(selectedAppSettings, settingID)
+	}
 
 	packageIDs := make([]string, 0, len(selected))
 	for packageID := range selected {
@@ -198,6 +230,19 @@ func Resolve(catalog Catalog, profiles map[string]Profile, machine Machine) (Des
 			spec.ID = recoveryID
 		}
 		state.Recoveries = append(state.Recoveries, spec)
+	}
+	settingIDs := make([]string, 0, len(selectedAppSettings))
+	for settingID := range selectedAppSettings {
+		settingIDs = append(settingIDs, settingID)
+	}
+	sort.Strings(settingIDs)
+	state.AppSettings = make([]model.AppSettingSpec, 0, len(settingIDs))
+	for _, settingID := range settingIDs {
+		spec := catalog.AppSettings[settingID]
+		if spec.ID == "" {
+			spec.ID = settingID
+		}
+		state.AppSettings = append(state.AppSettings, spec)
 	}
 	return state, nil
 }
