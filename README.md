@@ -187,6 +187,34 @@ while developing envctl. Both commands discover the canonical bootstrap
 checkout under `~/.local/share/envctl/repos`; `--source DIR` and
 `ENVCTL_SOURCE` remain available for unusual layouts.
 
+To publish portable configuration changes and apply them across the fleet, run:
+
+```sh
+envctl sync
+```
+
+No paths or machine IDs are normally required. Envctl discovers the private
+config checkout, identifies the current Mac from its hardware fingerprint,
+fetches `origin/main`, validates every machine configuration, and shows the
+tracked files that would be committed. It asks once before committing and
+pushing local changes, then applies portable links locally and fast-forwards
+and applies them on every reachable SSH-configured Mac. Offline Macs are
+reported as pending and catch up the next time `envctl sync` runs there or from
+another Mac while they are reachable.
+
+Use `envctl sync --dry-run` for a compact read-only review. Untracked files,
+divergent Git history, incoming commits mixed with local edits, invalid
+configuration, and occupied portable-link targets stop the sync rather than
+being guessed at. The command commits only already tracked or explicitly staged
+files; it never uses a blind `git add .`.
+
+The shared SSH host list is a portable file at
+`~/.ssh/envctl-hosts.conf`, included by the machine-local
+`~/.ssh/config`. Editing that file therefore edits the private Git checkout
+directly; `envctl sync` publishes the change to the other Macs. Private keys,
+`authorized_keys`, and machine-generated SSH configuration remain outside Git
+in encrypted recovery.
+
 ## Current commands
 
 ```sh
