@@ -863,9 +863,12 @@ func writeConfigSyncReport(
 		if len(report.UntrackedFiles) > 0 {
 			fmt.Fprintf(
 				output,
-				"  %d new file(s) need an add or ignore decision.\n",
+				"  %d new file(s) need an add or ignore decision:\n",
 				len(report.UntrackedFiles),
 			)
+			for _, path := range report.UntrackedFiles {
+				fmt.Fprintf(output, "    %s\n", path)
+			}
 		}
 		return nil
 	}

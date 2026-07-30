@@ -78,6 +78,30 @@ func TestCompactSyncErrorIsSingleLineAndBounded(t *testing.T) {
 	}
 }
 
+func TestDryRunReportListsUntrackedFiles(t *testing.T) {
+	var output bytes.Buffer
+	err := writeConfigSyncReport(
+		&output,
+		configSyncReport{
+			Mode:           "dry-run",
+			UntrackedFiles: []string{"portable/example/a", "portable/example/b"},
+		},
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{
+		"2 new file(s)",
+		"portable/example/a",
+		"portable/example/b",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("dry-run report missing %q: %q", expected, output.String())
+		}
+	}
+}
+
 func TestFastForwardMatchingConfigWorktree(t *testing.T) {
 	root := t.TempDir()
 	remote := filepath.Join(root, "remote.git")
