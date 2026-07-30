@@ -339,6 +339,21 @@ func TestValidateLinkTargetAllowsOnlyNonSecretGPGConfiguration(t *testing.T) {
 	}
 }
 
+func TestValidateLinkTargetAllowsOnlySharedSSHHostConfiguration(t *testing.T) {
+	if err := validateLinkTarget("~/.ssh/envctl-hosts.conf"); err != nil {
+		t.Fatalf("validateLinkTarget(shared hosts) error = %v", err)
+	}
+	for _, target := range []string{
+		"~/.ssh/config",
+		"~/.ssh/id_rsa",
+		"~/.ssh/authorized_keys",
+	} {
+		if err := validateLinkTarget(target); err == nil {
+			t.Fatalf("validateLinkTarget(%q) error = nil, want rejection", target)
+		}
+	}
+}
+
 func TestLoadResolvesRecoverySourcesAndTargets(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

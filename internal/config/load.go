@@ -749,7 +749,10 @@ func validateLinkTarget(target string) error {
 		filepath.Join(".gnupg", "gpg-agent.conf"): true,
 		filepath.Join(".gnupg", "gpg.conf"):       true,
 	}
-	if allowedGPGConfig[cleaned] {
+	allowedPortableState := map[string]bool{
+		filepath.Join(".ssh", "envctl-hosts.conf"): true,
+	}
+	if allowedGPGConfig[cleaned] || allowedPortableState[cleaned] {
 		return nil
 	}
 	blocked := []string{

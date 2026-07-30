@@ -65,6 +65,7 @@ Usage:
   envctl history --json [--state PATH] [--limit N]
   envctl update [--source DIR] [--ref BRANCH]
   envctl rebuild [--source DIR]
+  envctl sync [--config DIR] [--message TEXT] [--dry-run | --yes] [--json]
   envctl tui [--config DIR] [--inventory-dir DIR] [--state PATH]
   envctl fleet refresh [--config DIR] [--inventory-dir DIR] [--machines A,B] [--json]
   envctl fleet export-decisions [--config DIR] [--state PATH] [--json]
@@ -119,6 +120,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		return runSourceInstall(ctx, args[1:], stdout, stderr, true)
 	case "rebuild":
 		return runSourceInstall(ctx, args[1:], stdout, stderr, false)
+	case "sync":
+		return runConfigSync(ctx, args[1:], os.Stdin, stdout, stderr)
 	case "tui":
 		return runFleetTUI(ctx, args[1:], stderr)
 	case "fleet":
