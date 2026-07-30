@@ -223,7 +223,7 @@ func (m *Manager) verifyTailscaleAfterRestart(
 
 	statusOutput, statusErr := m.runner.Run(
 		ctx,
-		"/usr/local/bin/tailscale",
+		"/Applications/Tailscale.app/Contents/MacOS/Tailscale",
 		"status",
 		"--json",
 	)
