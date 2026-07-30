@@ -156,13 +156,27 @@ func runConfigSync(
 			strings.Join(untracked, ", "),
 		)
 	}
+	matchesIncoming := false
 	if report.RemoteAhead > 0 {
 		if len(statuses) > 0 {
-			return errors.New(
-				"env-config has both local edits and incoming commits; commit or discard the edits before syncing",
-			)
+			matchesRemote, matchErr := configSyncWorktreeMatchesRemote(ctx, root)
+			if matchErr != nil {
+				return matchErr
+			}
+			if !matchesRemote {
+				return errors.New(
+					"env-config has both local edits and incoming commits; commit or discard the edits before syncing",
+				)
+			}
+			if *dryRun {
+				matchesIncoming = true
+			} else if err := fastForwardMatchingConfigWorktree(ctx, root); err != nil {
+				return err
+			} else {
+				report.RemoteAhead = 0
+			}
 		}
-		if !*dryRun {
+		if !*dryRun && len(statuses) == 0 {
 			if err := executeGit(
 				ctx, root, stdout, stderr,
 				"merge", "--ff-only", "origin/"+defaultEnvConfigBranch,
@@ -176,6 +190,9 @@ func runConfigSync(
 	statuses, err = configSyncStatuses(ctx, root)
 	if err != nil {
 		return err
+	}
+	if matchesIncoming {
+		statuses = nil
 	}
 	report.ChangedFiles = configSyncChangedPaths(statuses)
 	if err := configSyncDiffCheck(ctx, root); err != nil {
@@ -395,6 +412,57 @@ func configSyncDiffCheck(ctx context.Context, root string) error {
 	return nil
 }
 
+func configSyncWorktreeMatchesRemote(
+	ctx context.Context,
+	root string,
+) (bool, error) {
+	ancestor := exec.CommandContext(
+		ctx,
+		"git", "-C", root,
+		"merge-base", "--is-ancestor",
+		"HEAD", "origin/"+defaultEnvConfigBranch,
+	)
+	if err := ancestor.Run(); err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, fmt.Errorf("check env-config ancestry: %w", err)
+	}
+	diff := exec.CommandContext(
+		ctx,
+		"git", "-C", root,
+		"diff", "--quiet", "origin/"+defaultEnvConfigBranch, "--",
+	)
+	if err := diff.Run(); err != nil {
+		var exitError *exec.ExitError
+		if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+			return false, nil
+		}
+		return false, fmt.Errorf("compare env-config with incoming commit: %w", err)
+	}
+	return true, nil
+}
+
+func fastForwardMatchingConfigWorktree(ctx context.Context, root string) error {
+	current, err := trimmedGitOutput(ctx, root, "rev-parse", "HEAD")
+	if err != nil {
+		return err
+	}
+	if err := executeGit(
+		ctx, root, io.Discard, io.Discard,
+		"update-ref", "HEAD", "origin/"+defaultEnvConfigBranch, current,
+	); err != nil {
+		return fmt.Errorf("advance matching env-config worktree: %w", err)
+	}
+	if err := executeGit(
+		ctx, root, io.Discard, io.Discard, "read-tree", "HEAD",
+	); err != nil {
+		return fmt.Errorf("refresh matching env-config index: %w", err)
+	}
+	return nil
+}
+
 func confirmConfigSync(input io.Reader, output io.Writer) (bool, error) {
 	fmt.Fprint(output, "\nPublish these changes and sync reachable Macs? [y/N] ")
 	line, err := bufio.NewReader(input).ReadString('\n')
@@ -482,7 +550,16 @@ config_root=$HOME/.local/share/envctl/repos/env-config
 envctl_bin=$HOME/.local/bin/envctl
 git -C "$config_root" diff --check
 git -C "$config_root" fetch --quiet origin main
-git -C "$config_root" merge --ff-only --quiet origin/main
+if test -n "$(git -C "$config_root" status --porcelain)" &&
+	git -C "$config_root" merge-base --is-ancestor HEAD origin/main &&
+	git -C "$config_root" diff --quiet origin/main -- &&
+	! git -C "$config_root" status --porcelain | grep -q '^??'; then
+	current_revision=$(git -C "$config_root" rev-parse HEAD)
+	git -C "$config_root" update-ref HEAD origin/main "$current_revision"
+	git -C "$config_root" read-tree HEAD
+else
+	git -C "$config_root" merge --ff-only --quiet origin/main
+fi
 "$envctl_bin" config validate --config "$config_root" --json >/dev/null
 "$envctl_bin" links apply --config "$config_root" --machine "$machine_id" --local --yes --json >/dev/null
 git -C "$config_root" rev-parse --short HEAD
