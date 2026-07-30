@@ -195,18 +195,24 @@ envctl sync
 
 No paths or machine IDs are normally required. Envctl discovers the private
 config checkout, identifies the current Mac from its hardware fingerprint,
-fetches `origin/main`, validates every machine configuration, and shows the
-tracked files that would be committed. It asks once before committing and
-pushing local changes, then applies portable links locally and fast-forwards
-and applies them on every reachable SSH-configured Mac. Offline Macs are
-reported as pending and catch up the next time `envctl sync` runs there or from
-another Mac while they are reachable.
+fetches `origin/main`, validates every machine configuration, and shows incoming
+commits and local changes. Each new file or directory gets an interactive
+choice: add it to Git, ignore it only on this Mac, add a shared `.gitignore`
+rule, or cancel. Automation with `--yes` remains conservative and stops rather
+than making this decision.
 
-Use `envctl sync --dry-run` for a compact read-only review. Untracked files,
-divergent Git history, incoming commits mixed with local edits, invalid
-configuration, and occupied portable-link targets stop the sync rather than
-being guessed at. The command commits only already tracked or explicitly staged
-files; it never uses a blind `git add .`.
+After one publish confirmation, envctl commits local work before rebasing it
+onto incoming commits. A genuine conflict aborts the rebase and preserves the
+local commit for review. A successful result is pushed, applied locally, then
+fast-forwarded and applied on every reachable SSH-configured Mac. Offline or
+locally changed Macs are reported as pending and catch up the next time
+`envctl sync` runs there or from another Mac while they are reachable.
+
+Use `envctl sync --dry-run` for a compact read-only review. Invalid
+configuration, unresolved history, and occupied portable-link targets stop the
+sync rather than being guessed at. The command stages tracked changes and only
+those new paths explicitly approved in the interactive review; it never uses a
+blind `git add .`.
 
 The shared SSH host list is a portable file at
 `~/.ssh/envctl-hosts.conf`, included by the machine-local

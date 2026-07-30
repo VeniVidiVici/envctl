@@ -40,6 +40,7 @@ type configSyncReport struct {
 	LocalMachine    string             `json:"local_machine"`
 	Branch          string             `json:"branch"`
 	ChangedFiles    []string           `json:"changed_files,omitempty"`
+	UntrackedFiles  []string           `json:"untracked_files,omitempty"`
 	Committed       bool               `json:"committed"`
 	Pushed          bool               `json:"pushed"`
 	LocalApplied    bool               `json:"local_applied"`
@@ -85,6 +86,7 @@ func runConfigSync(
 	if strings.ContainsAny(*message, "\r\n") {
 		return errors.New("sync commit message must be a single line")
 	}
+	inputReader := bufio.NewReader(input)
 
 	root, err := resolveConfigRoot(*configRoot)
 	if err != nil {
@@ -138,36 +140,45 @@ func runConfigSync(
 	if err != nil {
 		return err
 	}
-	if report.LocalAhead > 0 && report.RemoteAhead > 0 {
-		return fmt.Errorf(
-			"env-config history has diverged (%d local, %d remote); reconcile it before syncing",
-			report.LocalAhead,
-			report.RemoteAhead,
-		)
-	}
 
 	statuses, err := configSyncStatuses(ctx, root)
 	if err != nil {
 		return err
 	}
-	if untracked := configSyncUntracked(statuses); len(untracked) > 0 {
-		return fmt.Errorf(
-			"env-config has untracked files; review and git add or remove them first: %s",
-			strings.Join(untracked, ", "),
-		)
+	report.UntrackedFiles = configSyncUntracked(statuses)
+	if len(report.UntrackedFiles) > 0 && !*dryRun {
+		if *yes || *asJSON {
+			return fmt.Errorf(
+				"env-config has untracked files that require an interactive add or ignore decision: %s",
+				strings.Join(report.UntrackedFiles, ", "),
+			)
+		}
+		if err := reviewConfigSyncUntracked(
+			ctx, root, inputReader, stdout,
+		); err != nil {
+			return err
+		}
+		statuses, err = configSyncStatuses(ctx, root)
+		if err != nil {
+			return err
+		}
+		report.UntrackedFiles = configSyncUntracked(statuses)
+		if len(report.UntrackedFiles) > 0 {
+			return fmt.Errorf(
+				"sync still has unreviewed files: %s",
+				strings.Join(report.UntrackedFiles, ", "),
+			)
+		}
 	}
+
 	matchesIncoming := false
-	if report.RemoteAhead > 0 {
-		if len(statuses) > 0 {
-			matchesRemote, matchErr := configSyncWorktreeMatchesRemote(ctx, root)
-			if matchErr != nil {
-				return matchErr
-			}
-			if !matchesRemote {
-				return errors.New(
-					"env-config has both local edits and incoming commits; commit or discard the edits before syncing",
-				)
-			}
+	if report.RemoteAhead > 0 && report.LocalAhead == 0 &&
+		len(statuses) > 0 && len(report.UntrackedFiles) == 0 {
+		matchesRemote, matchErr := configSyncWorktreeMatchesRemote(ctx, root)
+		if matchErr != nil {
+			return matchErr
+		}
+		if matchesRemote {
 			if *dryRun {
 				matchesIncoming = true
 			} else if err := fastForwardMatchingConfigWorktree(ctx, root); err != nil {
@@ -175,15 +186,6 @@ func runConfigSync(
 			} else {
 				report.RemoteAhead = 0
 			}
-		}
-		if !*dryRun && len(statuses) == 0 {
-			if err := executeGit(
-				ctx, root, stdout, stderr,
-				"merge", "--ff-only", "origin/"+defaultEnvConfigBranch,
-			); err != nil {
-				return fmt.Errorf("fast-forward env-config: %w", err)
-			}
-			report.RemoteAhead = 0
 		}
 	}
 
@@ -203,8 +205,15 @@ func runConfigSync(
 	}
 
 	needsPublish := len(report.ChangedFiles) > 0 || report.LocalAhead > 0
+	if !*asJSON && report.RemoteAhead > 0 {
+		fmt.Fprintf(
+			stdout,
+			"\nIncoming from GitHub: %d commit(s)\n",
+			report.RemoteAhead,
+		)
+	}
 	if len(report.ChangedFiles) > 0 && !*asJSON {
-		fmt.Fprintln(stdout, "\nTracked changes ready to publish:")
+		fmt.Fprintln(stdout, "\nLocal changes ready to publish:")
 		for _, path := range report.ChangedFiles {
 			fmt.Fprintf(stdout, "  %s\n", path)
 		}
@@ -225,7 +234,7 @@ func runConfigSync(
 		if *asJSON {
 			return errors.New("sync with publishable changes requires --yes when using --json")
 		}
-		confirmed, confirmErr := confirmConfigSync(input, stdout)
+		confirmed, confirmErr := confirmConfigSync(inputReader, stdout)
 		if confirmErr != nil {
 			return confirmErr
 		}
@@ -248,7 +257,36 @@ func runConfigSync(
 			return fmt.Errorf("commit env-config: %w", err)
 		}
 		report.Committed = true
-		report.LocalAhead++
+	}
+
+	report.LocalAhead, report.RemoteAhead, err = configSyncAheadBehind(ctx, root)
+	if err != nil {
+		return err
+	}
+	if report.RemoteAhead > 0 {
+		if report.LocalAhead > 0 {
+			fmt.Fprintf(
+				stdout,
+				"Combining %d local and %d incoming commit(s)\n",
+				report.LocalAhead,
+				report.RemoteAhead,
+			)
+			if err := rebaseConfigSync(ctx, root, stdout, stderr); err != nil {
+				return err
+			}
+		} else if err := executeGit(
+			ctx, root, stdout, stderr,
+			"merge", "--ff-only", "origin/"+defaultEnvConfigBranch,
+		); err != nil {
+			return fmt.Errorf("fast-forward env-config: %w", err)
+		}
+	}
+	report.LocalAhead, report.RemoteAhead, err = configSyncAheadBehind(ctx, root)
+	if err != nil {
+		return err
+	}
+	if report.RemoteAhead > 0 {
+		return errors.New("env-config still has incoming commits after integration")
 	}
 	if report.LocalAhead > 0 {
 		if err := executeGit(
@@ -258,6 +296,7 @@ func runConfigSync(
 			return fmt.Errorf("push env-config: %w", err)
 		}
 		report.Pushed = true
+		report.LocalAhead = 0
 	}
 	report.Revision, err = trimmedGitOutput(ctx, root, "rev-parse", "--short", "HEAD")
 	if err != nil {
@@ -345,8 +384,19 @@ func configSyncAheadBehind(ctx context.Context, root string) (int, int, error) {
 }
 
 func configSyncStatuses(ctx context.Context, root string) ([]configSyncStatus, error) {
+	return configSyncStatusesWithMode(ctx, root, "all")
+}
+
+func configSyncStatusesWithMode(
+	ctx context.Context,
+	root, untrackedMode string,
+) ([]configSyncStatus, error) {
+	if untrackedMode != "all" && untrackedMode != "normal" {
+		return nil, fmt.Errorf("unsupported untracked status mode %q", untrackedMode)
+	}
 	output, err := gitOutput(
-		ctx, root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+		ctx, root, "status", "--porcelain=v1", "-z",
+		"--untracked-files="+untrackedMode,
 	)
 	if err != nil {
 		return nil, err
@@ -398,6 +448,159 @@ func configSyncUntracked(statuses []configSyncStatus) []string {
 		}
 	}
 	return paths
+}
+
+func reviewConfigSyncUntracked(
+	ctx context.Context,
+	root string,
+	input *bufio.Reader,
+	output io.Writer,
+) error {
+	statuses, err := configSyncStatusesWithMode(ctx, root, "normal")
+	if err != nil {
+		return err
+	}
+	paths := configSyncUntracked(statuses)
+	if len(paths) == 0 {
+		return nil
+	}
+	fmt.Fprintln(output, "\nNew local files need a decision:")
+	for _, path := range paths {
+		for {
+			fmt.Fprintf(
+				output,
+				"\n  %s\n"+
+					"    [a] add files to Git\n"+
+					"    [l] ignore only on this Mac\n"+
+					"    [g] ignore on every Mac\n"+
+					"    [q] cancel sync\n"+
+					"  Choice [a/l/g/q]: ",
+				path,
+			)
+			line, readErr := input.ReadString('\n')
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				return fmt.Errorf("read untracked-file decision: %w", readErr)
+			}
+			switch strings.ToLower(strings.TrimSpace(line)) {
+			case "a", "add":
+				if err := executeGit(
+					ctx, root, io.Discard, io.Discard, "add", "--", path,
+				); err != nil {
+					return fmt.Errorf("stage %q: %w", path, err)
+				}
+				fmt.Fprintln(output, "  Added to this sync.")
+			case "l", "local":
+				if err := addConfigSyncIgnore(
+					ctx, root, path, false,
+				); err != nil {
+					return err
+				}
+				fmt.Fprintln(output, "  Ignored only on this Mac.")
+			case "g", "global", "shared":
+				if err := addConfigSyncIgnore(
+					ctx, root, path, true,
+				); err != nil {
+					return err
+				}
+				if err := executeGit(
+					ctx, root, io.Discard, io.Discard,
+					"add", "--", ".gitignore",
+				); err != nil {
+					return fmt.Errorf("stage shared ignore rule: %w", err)
+				}
+				fmt.Fprintln(output, "  Shared ignore rule added to this sync.")
+			case "q", "quit", "":
+				return errors.New("sync cancelled; no untracked files were published")
+			default:
+				fmt.Fprintln(output, "  Please choose a, l, g, or q.")
+				continue
+			}
+			break
+		}
+	}
+	return nil
+}
+
+func addConfigSyncIgnore(
+	ctx context.Context,
+	root, path string,
+	shared bool,
+) error {
+	pattern, err := configSyncIgnorePattern(path)
+	if err != nil {
+		return err
+	}
+	destination := filepath.Join(root, ".gitignore")
+	if !shared {
+		gitPath, pathErr := trimmedGitOutput(
+			ctx, root, "rev-parse", "--git-path", "info/exclude",
+		)
+		if pathErr != nil {
+			return pathErr
+		}
+		destination = gitPath
+		if !filepath.IsAbs(destination) {
+			destination = filepath.Join(root, destination)
+		}
+	}
+	info, statErr := os.Lstat(destination)
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return fmt.Errorf("inspect ignore file: %w", statErr)
+	}
+	if statErr == nil &&
+		(!info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0) {
+		return fmt.Errorf("ignore file is not a regular non-symlink file: %s", destination)
+	}
+	existing, readErr := os.ReadFile(destination)
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return fmt.Errorf("read ignore file: %w", readErr)
+	}
+	for _, line := range strings.Split(string(existing), "\n") {
+		if line == pattern {
+			return nil
+		}
+	}
+	file, openErr := os.OpenFile(
+		destination,
+		os.O_WRONLY|os.O_CREATE|os.O_APPEND,
+		0o644,
+	)
+	if openErr != nil {
+		return fmt.Errorf("open ignore file: %w", openErr)
+	}
+	if len(existing) > 0 && existing[len(existing)-1] != '\n' {
+		if _, err := file.WriteString("\n"); err != nil {
+			file.Close()
+			return fmt.Errorf("separate ignore rule: %w", err)
+		}
+	}
+	if _, err := file.WriteString(pattern + "\n"); err != nil {
+		file.Close()
+		return fmt.Errorf("write ignore rule: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close ignore file: %w", err)
+	}
+	return nil
+}
+
+func configSyncIgnorePattern(path string) (string, error) {
+	if path == "" || filepath.IsAbs(path) ||
+		strings.ContainsAny(path, "\r\n\\") {
+		return "", fmt.Errorf("unsafe untracked path %q", path)
+	}
+	isDirectory := strings.HasSuffix(path, "/")
+	cleaned := filepath.Clean(path)
+	if cleaned == "." || cleaned == ".." ||
+		strings.HasPrefix(cleaned, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("unsafe untracked path %q", path)
+	}
+	pattern := "/" + filepath.ToSlash(cleaned)
+	pattern = strings.ReplaceAll(pattern, " ", `\ `)
+	if isDirectory {
+		pattern += "/"
+	}
+	return pattern, nil
 }
 
 func configSyncDiffCheck(ctx context.Context, root string) error {
@@ -461,6 +664,37 @@ func fastForwardMatchingConfigWorktree(ctx context.Context, root string) error {
 		return fmt.Errorf("refresh matching env-config index: %w", err)
 	}
 	return nil
+}
+
+func rebaseConfigSync(
+	ctx context.Context,
+	root string,
+	stdout, stderr io.Writer,
+) error {
+	if err := executeGit(
+		ctx, root, stdout, stderr,
+		"rebase", "origin/"+defaultEnvConfigBranch,
+	); err == nil {
+		return nil
+	} else {
+		abortErr := executeGit(
+			ctx, root, io.Discard, io.Discard, "rebase", "--abort",
+		)
+		if abortErr != nil {
+			return errors.Join(
+				fmt.Errorf(
+					"combine local and incoming config commits: %w; automatic rebase was left active",
+					err,
+				),
+				abortErr,
+			)
+		}
+		return fmt.Errorf(
+			"local config was committed, but it conflicts with incoming changes; "+
+				"the rebase was aborted and the local commit was preserved: %w",
+			err,
+		)
+	}
 }
 
 func confirmConfigSync(input io.Reader, output io.Writer) (bool, error) {
@@ -624,13 +858,20 @@ func writeConfigSyncReport(
 			fmt.Fprintf(output, "  %d incoming commit(s) would be applied.\n", report.RemoteAhead)
 		}
 		if len(report.ChangedFiles) > 0 {
-			fmt.Fprintf(output, "  %d tracked file(s) would be published.\n", len(report.ChangedFiles))
+			fmt.Fprintf(output, "  %d local file(s) would be published.\n", len(report.ChangedFiles))
+		}
+		if len(report.UntrackedFiles) > 0 {
+			fmt.Fprintf(
+				output,
+				"  %d new file(s) need an add or ignore decision.\n",
+				len(report.UntrackedFiles),
+			)
 		}
 		return nil
 	}
 	fmt.Fprintf(output, "\nEnv config synced at %s.\n", report.Revision)
 	if report.Committed {
-		fmt.Fprintf(output, "  Published %d tracked file(s).\n", len(report.ChangedFiles))
+		fmt.Fprintf(output, "  Published %d local file(s).\n", len(report.ChangedFiles))
 	} else if report.Pushed {
 		fmt.Fprintln(output, "  Published existing local commit(s).")
 	} else {
