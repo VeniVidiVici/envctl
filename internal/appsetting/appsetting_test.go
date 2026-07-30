@@ -43,7 +43,10 @@ func (r *fakeRunner) Run(
 	if name == "/bin/launchctl" {
 		return []byte("service registered\n"), nil
 	}
-	if name == "/Applications/Tailscale.app/Contents/MacOS/Tailscale" {
+	if name == "/usr/bin/env" &&
+		len(args) > 1 &&
+		args[0] == "TAILSCALE_BE_CLI=1" &&
+		args[1] == "/Applications/Tailscale.app/Contents/MacOS/Tailscale" {
 		return []byte(
 			`{"BackendState":"Running","Self":{"Online":true}}`,
 		), nil
